@@ -1,4 +1,4 @@
-+# app.py
+# app.py
 # ============================================================
 # MT5 Portfolio Lab (CSV-only) — Streamlit Web App
 # ============================================================
@@ -9,18 +9,20 @@
 # - Top N peores drawdowns por activo (peak->trough, fechas y duración)
 # - Correlación normal + rolling correlation + clustering (sin matplotlib)
 # - Regímenes Calm/Mid/Stress + Heatmap Stress - Calm
-# - Comparador genérico (cualquier par): precio normalizado + volumen MA + ratio (opcional)
 # - “Momentos más volátiles” para CUALQUIER activo (picos de vol rolling + tabla)
+# - Comparador genérico (cualquier par): precio normalizado + ratio + volumen MA
 # - “Qué pasó esta semana” por activo
 #
-# Nota: “Oro vs Plata” es SOLO un preset (si detecta XAU... y XAG... lo sugiere),
-# pero el comparador y los picos de volatilidad funcionan para todos los símbolos.
+# Requisitos:
+#   streamlit, pandas, numpy, plotly, scipy
+#
+# Uso:
+# - Exporta desde MT5 a CSV (ideal Daily). Si es H1/M15, esta app lo resamplea a diario.
+# - Sube 1+ archivos. Ideal: 1 CSV por símbolo, nombre = SIMBOLO.csv (EURUSD.csv, XAUUSD.csv, BTCUSD.csv, etc.)
 # ============================================================
 
 import io
 import re
-from datetime import date, timedelta
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -383,7 +385,7 @@ if not uploads:
         st.write("Nombra: EURUSD.csv, XAUUSD.csv, BTCUSD.csv, etc.")
     st.stop()
 
-# Overrides (por si filename no sirve)
+# Overrides
 with st.sidebar.expander("🧷 Asignación de símbolo por archivo", expanded=False):
     overrides = {}
     for f in uploads:
@@ -570,7 +572,6 @@ with tab2:
     fig.update_layout(title=f"{sym} – Precio", height=320, margin=dict(l=20,r=20,t=50,b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-    # drawdown curve
     dd = close/close.cummax()-1
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines"))
@@ -578,7 +579,6 @@ with tab2:
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
-    # top dd events
     ev = drawdown_events(close)
     st.markdown(f"### 🧨 Top {top_dd_n} peores drawdowns (peak → trough)")
     if ev.empty:
@@ -694,7 +694,7 @@ with tab4:
 # ===== TAB 5 =====
 with tab5:
     st.subheader("Eventos extremos + Comparador (cualquier símbolo)")
-    st.caption("Esto NO es solo oro/plata: el comparador y los picos de volatilidad funcionan para cualquier activo.")
+    st.caption("Esto NO es solo oro/plata: picos de volatilidad y comparador sirven para cualquier activo.")
 
     subA, subB = st.tabs(["🔥 Picos de volatilidad", "🆚 Comparador (2 activos)"])
 
@@ -724,12 +724,6 @@ with tab5:
             )
 
     with subB:
-        # Preset oro/plata si existe
-        gold_candidates = [s for s in symbols if s.upper().startswith("XAU")]
-        silv_candidates = [s for s in symbols if s.upper().startswith("XAG")]
-        if gold_candidates and silv_candidates:
-            st.success(f"Preset detectado: Oro={gold_candidates[0]} vs Plata={silv_candidates[0]} (pero puedes elegir cualquier par abajo).")
-
         col1, col2 = st.columns(2)
         a = col1.selectbox("Activo A", options=symbols, index=0, key="cmp_a")
         b = col2.selectbox("Activo B", options=symbols, index=1 if len(symbols)>1 else 0, key="cmp_b")
@@ -751,7 +745,6 @@ with tab5:
         if df.empty or len(df) < 60:
             st.info("No hay suficiente traslape entre ambos activos en esa ventana. Amplía rango o elige otros.")
         else:
-            # precio normalizado
             norm_a = df["A_Close"]/df["A_Close"].iloc[0]
             norm_b = df["B_Close"]/df["B_Close"].iloc[0]
 
@@ -761,14 +754,12 @@ with tab5:
             fig.update_layout(title="Precio normalizado", height=300, margin=dict(l=20,r=20,t=50,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            # ratio A/B
             ratio = df["A_Close"]/df["B_Close"]
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df.index, y=ratio.values, mode="lines", name="A/B"))
             fig.update_layout(title=f"Ratio {a}/{b}", height=240, margin=dict(l=20,r=20,t=50,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
-            # volumen MA20 (si hay)
             fig = go.Figure()
             if df["A_Vol"].notna().any():
                 fig.add_trace(go.Scatter(x=df.index, y=df["A_Vol"].rolling(20).mean(), mode="lines", name=f"{a} Vol MA20"))
@@ -778,4 +769,3 @@ with tab5:
             st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("Disclaimer: análisis estadístico; no es asesoría financiera.")
