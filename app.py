@@ -1,13 +1,36 @@
-import io
-import re
-import csv
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MT5 Portfolio Lab (CSV-only, robusto) — basado en el loader de analyzer_xauusd_m1.py
+
+- NO Yahoo. Solo CSV de MT5.
+- SOPORTA tu formato EXACTO:
+  <DATE> <TIME> <OPEN> <HIGH> <LOW> <CLOSE> <TICKVOL> <VOL> <SPREAD>
+  (tab o espacios; UTF-8 o UTF-16)
+- Multi-símbolo (subes varios archivos)
+- Todo lo que pedían:
+  * métricas por activo (precio, vol, ATR, rango, ADX, R2, DD)
+  * top N peores drawdowns peak→trough
+  * qué pasó esta semana
+  * correlación normal + rolling corr + clustering
+  * regímenes Calm/Mid/Stress + Stress−Calm
+  * picos de volatilidad para cualquier activo
+  * comparador 2 activos (normalizado + ratio + volumen MA)
+"""
+
+from __future__ import annotations
+import io, re, csv
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+
 import numpy as np
 import pandas as pd
+import pytz
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Dendrograma sin matplotlib
+# clustering sin matplotlib
 try:
     from scipy.cluster.hierarchy import linkage
     from scipy.spatial.distance import squareform
@@ -16,159 +39,170 @@ try:
 except Exception:
     SCIPY_OK = False
 
+
+# ------------------ config ------------------
 st.set_page_config(page_title="MT5 Portfolio Lab", page_icon="📈", layout="wide")
 st.title("📈 MT5 Portfolio Lab (MT5 CSV only)")
-st.caption("Hecho para export MT5 tipo: <DATE> <TIME> <OPEN> <HIGH> <LOW> <CLOSE> <TICKVOL> <VOL> <SPREAD> (tabs/espacios, UTF-16/UTF-8).")
+st.caption("Loader calcado del analyzer que SÍ te parsea. Sin Yahoo. Multi-símbolo.")
+
+TZ_CDMX = pytz.timezone("America/Mexico_City")
+
 
 # ============================================================
-# Utils
+# 1) Loader MT5 (calcado del analyzer, con fallback whitespace/tab y UTF-16)
 # ============================================================
-def norm_col(c: str) -> str:
-    c = str(c).strip().replace("\ufeff", "")
-    c = re.sub(r"[<>]", "", c)   # <DATE> -> DATE
-    c = c.lower()
-    c = c.replace(" ", "_")
-    c = re.sub(r"[^a-z0-9_]", "", c)
-    return c
+def detect_encoding(file_bytes: bytes) -> str:
+    # BOM
+    if file_bytes.startswith(b"\xff\xfe") or file_bytes.startswith(b"\xfe\xff"):
+        return "utf-16"
+    if file_bytes.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    # heurística: bytes nulos -> utf-16
+    if b"\x00" in file_bytes[:2000]:
+        return "utf-16"
+    return "utf-8-sig"
+
+def first_line_bytes(file_bytes: bytes) -> bytes:
+    # primera línea cruda
+    i = file_bytes.find(b"\n")
+    return file_bytes if i == -1 else file_bytes[:i]
 
 def infer_symbol_from_filename(name: str) -> str:
     base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    base = base.rsplit(".", 1)[0].strip().upper()
-    # tu caso: XAUUSD_M1_2024 -> XAUUSD
-    base = base.split("_")[0].upper()
-    base = re.split(r"[,\s;()\-]+", base)[0].upper()
-    return base
+    base = base.rsplit(".", 1)[0].strip()
+    # tu caso típico: XAUUSD_M1_2024.csv -> XAUUSD
+    sym = base.split("_")[0].upper()
+    sym = re.split(r"[,\s;()\-]+", sym)[0]
+    return sym.upper()
 
-def to_numeric(s: pd.Series) -> pd.Series:
-    x = s.astype(str).str.replace(" ", "", regex=False)
-    mask = x.str.contains(",") & (~x.str.contains(r"\.", regex=True))
-    x.loc[mask] = x.loc[mask].str.replace(",", ".", regex=False)
-    x = x.str.replace(",", "", regex=False)
-    return pd.to_numeric(x, errors="coerce")
-
-def detect_bom_encoding(b: bytes) -> str | None:
-    if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
-        return "utf-16"
-    if b.startswith(b"\xef\xbb\xbf"):
-        return "utf-8-sig"
-    return None
-
-def read_mt5_file(file_bytes: bytes) -> tuple[pd.DataFrame, dict]:
+@st.cache_data(show_spinner=False)
+def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
     """
-    Lee MT5 “CSV” robusto:
-    - UTF-16 / UTF-8 / latin1
-    - separadores: whitespace, tab, ;, ,
+    Devuelve df con columnas:
+    datetime_utc (tz-aware UTC), datetime_cdmx (tz-aware CDMX),
+    Open High Low Close Volume range_pts
     """
-    info = {"encoding": None, "sep": None, "note": ""}
+    enc = detect_encoding(file_bytes)
+    head = first_line_bytes(file_bytes)
+    try:
+        head_txt = head.decode(enc, errors="ignore").lstrip()
+    except Exception:
+        head_txt = head.decode("utf-8", errors="ignore").lstrip()
 
-    bom = detect_bom_encoding(file_bytes)
-    looks_utf16 = (bom == "utf-16") or (b"\x00" in file_bytes[:2000])
+    is_csv = head_txt.startswith("<DATE>")
 
-    if looks_utf16:
-        encodings = ["utf-16", "utf-16le", "utf-16be", "utf-8-sig", "latin1"]
+    info = {"encoding": enc, "format": "mt5_<DATE>" if is_csv else "mt5_alt"}
+
+    bio = io.BytesIO(file_bytes)
+
+    if is_csv:
+        # --- igualito que tu analyzer, pero con fallback si no era TAB ---
+        usecols = ["<DATE>", "<TIME>", "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<TICKVOL>"]
+
+        # intento 1: sep="\t" (lo que hace tu analyzer)
+        try:
+            bio.seek(0)
+            df = pd.read_csv(
+                bio,
+                sep="\t",
+                usecols=usecols,
+                encoding=enc,
+            ).rename(columns={
+                "<DATE>": "Date", "<TIME>": "Time",
+                "<OPEN>": "Open", "<HIGH>": "High",
+                "<LOW>": "Low", "<CLOSE>": "Close",
+                "<TICKVOL>": "Volume",
+            })
+        except Exception:
+            df = None
+
+        # intento 2: whitespace (por si el export vino con espacios)
+        if df is None or df.empty or any(c not in df.columns for c in ["Date","Time","Open","High","Low","Close","Volume"]):
+            bio.seek(0)
+            df = pd.read_csv(
+                bio,
+                sep=r"\s+",
+                engine="python",
+                usecols=usecols,
+                encoding=enc,
+            ).rename(columns={
+                "<DATE>": "Date", "<TIME>": "Time",
+                "<OPEN>": "Open", "<HIGH>": "High",
+                "<LOW>": "Low", "<CLOSE>": "Close",
+                "<TICKVOL>": "Volume",
+            })
+
+        dt_utc = pd.to_datetime(
+            df["Date"].astype(str) + " " + df["Time"].astype(str),
+            format="%Y.%m.%d %H:%M:%S",
+            utc=True,
+            errors="coerce",
+        )
+
     else:
-        encodings = ["utf-8-sig", "utf-8", "latin1", "utf-16"]
+        # formato alterno (por compatibilidad): names + delim_whitespace
+        cols = ["Symbol", "Date", "Time", "Open", "High", "Low", "Close", "Volume"]
+        bio.seek(0)
+        df = pd.read_csv(
+            bio,
+            names=cols,
+            header=None,
+            delim_whitespace=True,
+            encoding=enc,
+        )
+        dt_utc = pd.to_datetime(
+            df["Date"].astype(str) + df["Time"].astype(str),
+            format="%Y%m%d%H%M%S",
+            utc=True,
+            errors="coerce",
+        )
 
-    seps = [r"\s+", "\t", ";", ","]
-    last_err = None
+    # limpieza y columnas finales
+    df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
 
-    for enc in encodings:
-        for sep in seps:
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(file_bytes),
-                    sep=sep,
-                    engine="python" if sep == r"\s+" else "c",
-                    encoding=enc,
-                )
-                if df is None or df.empty:
-                    continue
-                df.columns = [norm_col(c) for c in df.columns]
-                if df.shape[1] < 5:
-                    continue
-                info["encoding"] = enc
-                info["sep"] = sep
-                return df, info
-            except Exception as e:
-                last_err = e
-                continue
+    dt_cdmx = df["datetime_utc"].dt.tz_convert(TZ_CDMX)
+    df = df.assign(datetime_cdmx=dt_cdmx)
 
-    info["note"] = f"No pude leer: {last_err}"
-    return pd.DataFrame(), info
+    # numéricos
+    for c in ["Open","High","Low","Close","Volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Open","High","Low","Close"])
 
-def parse_mt5_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Espera columnas (normalizadas):
-    date time open high low close tickvol vol spread
-    """
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+    df = df.sort_values("datetime_utc")
+    df["range_pts"] = df["High"] - df["Low"]
 
-    cols = set(df.columns)
-    # DATE + TIME (tu formato)
-    if "date" in cols and "time" in cols:
-        combo = df["date"].astype(str).str.strip() + " " + df["time"].astype(str).str.strip()
-        dt = pd.to_datetime(combo, format="%Y.%m.%d %H:%M:%S", errors="coerce")
-        if dt.isna().mean() > 0.05:
-            dt = pd.to_datetime(combo, errors="coerce")
-    else:
-        # fallback
-        for cand in ["datetime", "timestamp", "time", "date"]:
-            if cand in cols:
-                dt = pd.to_datetime(df[cand], errors="coerce")
-                break
-        else:
-            return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
+    df = df[[
+        "datetime_utc", "datetime_cdmx",
+        "Open","High","Low","Close","Volume","range_pts"
+    ]]
 
-    out = df.copy()
-    out["_dt"] = dt
-    out = out.dropna(subset=["_dt"]).sort_values("_dt")
+    return df, info
 
-    need = ["open","high","low","close"]
-    if not all(c in out.columns for c in need):
-        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
 
-    o = pd.DataFrame(index=pd.to_datetime(out["_dt"]).dt.tz_localize(None))
-    o["Open"]  = to_numeric(out["open"])
-    o["High"]  = to_numeric(out["high"])
-    o["Low"]   = to_numeric(out["low"])
-    o["Close"] = to_numeric(out["close"])
-
-    # Volumen: preferir tickvol (tu caso)
-    if "tickvol" in cols:
-        o["Volume"] = to_numeric(out["tickvol"])
-    elif "tick_volume" in cols:
-        o["Volume"] = to_numeric(out["tick_volume"])
-    elif "volume" in cols:
-        o["Volume"] = to_numeric(out["volume"])
-    elif "vol" in cols:
-        o["Volume"] = to_numeric(out["vol"])
-    else:
-        o["Volume"] = np.nan
-
-    o = o.dropna(subset=["Close"])
-    o = o[~o.index.duplicated(keep="last")]
-    return o[["Open","High","Low","Close","Volume"]]
-
+# ============================================================
+# 2) Resample OHLCV
+# ============================================================
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return df
-    d = df.copy()
+    x = df.copy()
+    x = x.set_index("datetime_cdmx")  # trabajamos en CDMX para “semana”/sesiones si quieres luego
     out = pd.DataFrame({
-        "Open":  d["Open"].resample(rule).first(),
-        "High":  d["High"].resample(rule).max(),
-        "Low":   d["Low"].resample(rule).min(),
-        "Close": d["Close"].resample(rule).last(),
-        "Volume":d["Volume"].resample(rule).sum(min_count=1),
-    })
-    out = out.dropna(subset=["Close"])
+        "Open":  x["Open"].resample(rule).first(),
+        "High":  x["High"].resample(rule).max(),
+        "Low":   x["Low"].resample(rule).min(),
+        "Close": x["Close"].resample(rule).last(),
+        "Volume":x["Volume"].resample(rule).sum(min_count=1),
+    }).dropna(subset=["Close"])
+    out.index.name = "datetime_cdmx"
     return out
 
+
 # ============================================================
-# Metrics / indicators
+# 3) Métricas, DD, ADX/ATR, etc.
 # ============================================================
 def compute_adx_atr(df: pd.DataFrame, n=14):
-    if df.empty or df["Close"].dropna().empty:
+    if df.empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
     close = df["Close"].astype(float)
@@ -197,7 +231,7 @@ def compute_adx_atr(df: pd.DataFrame, n=14):
     adx = dx.ewm(alpha=1/n, adjust=False).mean()
     return adx, atr
 
-def trend_r2(close: pd.Series):
+def trend_r2(close: pd.Series) -> float:
     close = close.dropna()
     if len(close) < 200:
         return np.nan
@@ -207,10 +241,9 @@ def trend_r2(close: pd.Series):
     yhat = slope*x + intercept
     ss_res = np.sum((y - yhat)**2)
     ss_tot = np.sum((y - y.mean())**2)
-    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
-    return float(r2)
+    return float(1 - ss_res/ss_tot) if ss_tot > 0 else np.nan
 
-def max_drawdown(close: pd.Series):
+def max_drawdown(close: pd.Series) -> float:
     close = close.dropna()
     if close.empty:
         return np.nan
@@ -233,10 +266,10 @@ def drawdown_events(close: pd.Series) -> pd.DataFrame:
         if price >= peak_price:
             if in_dd:
                 events.append({
-                    "Peak Date": peak_date,
-                    "Trough Date": trough_date,
-                    "Recovery Date": dt,
-                    "Drawdown %": (trough_price/peak_price - 1),
+                    "Peak": peak_date,
+                    "Trough": trough_date,
+                    "Recovery": dt,
+                    "DD%": (trough_price/peak_price - 1),
                 })
                 in_dd = False
             peak_price = price
@@ -254,22 +287,21 @@ def drawdown_events(close: pd.Series) -> pd.DataFrame:
 
     if in_dd:
         events.append({
-            "Peak Date": peak_date,
-            "Trough Date": trough_date,
-            "Recovery Date": pd.NaT,
-            "Drawdown %": (trough_price/peak_price - 1),
+            "Peak": peak_date,
+            "Trough": trough_date,
+            "Recovery": pd.NaT,
+            "DD%": (trough_price/peak_price - 1),
         })
 
     ev = pd.DataFrame(events)
     if ev.empty:
         return ev
-
-    ev["Days Peak->Trough"] = (pd.to_datetime(ev["Trough Date"]) - pd.to_datetime(ev["Peak Date"])).dt.days
-    ev = ev.sort_values("Drawdown %").reset_index(drop=True)
+    ev["Days Peak->Trough"] = (pd.to_datetime(ev["Trough"]) - pd.to_datetime(ev["Peak"])).dt.days
+    ev = ev.sort_values("DD%").reset_index(drop=True)
     return ev
 
-def annualization_factor(rule: str) -> int:
-    # barras por año aprox
+def ann_factor(rule: str) -> int:
+    # anualización aproximada por barras
     if rule == "1D": return 252
     if rule == "1H": return 252*24
     if rule == "15T": return 252*96
@@ -277,13 +309,13 @@ def annualization_factor(rule: str) -> int:
     if rule == "1T": return 252*1440
     return 252
 
-def compute_metrics(df: pd.DataFrame, rule: str):
-    close = df["Close"].dropna()
-    if len(close) < 200:
+def compute_metrics(df: pd.DataFrame, rule: str) -> Optional[dict]:
+    if df.empty or df["Close"].dropna().shape[0] < 200:
         return None
 
-    rets  = close.pct_change().dropna()
-    ann = annualization_factor(rule)
+    close = df["Close"].dropna()
+    rets = close.pct_change().dropna()
+    ann = ann_factor(rule)
 
     days = (close.index[-1] - close.index[0]).days
     years = max(days/365.25, 1e-9)
@@ -291,22 +323,19 @@ def compute_metrics(df: pd.DataFrame, rule: str):
     total_ret = float(close.iloc[-1]/close.iloc[0] - 1)
     cagr = float((close.iloc[-1]/close.iloc[0])**(1/years) - 1) if close.iloc[0] > 0 else np.nan
     vol_ann = float(rets.std()*np.sqrt(ann))
-    sharpe  = float(cagr/vol_ann) if vol_ann > 0 else np.nan
+    sharpe = float(cagr/vol_ann) if vol_ann > 0 else np.nan
     mdd = max_drawdown(close)
 
     high = df["High"].fillna(close)
     low  = df["Low"].fillna(close)
     avg_range = float(((high-low).abs()/close).replace([np.inf,-np.inf], np.nan).dropna().mean())
 
-    adx, atr = compute_adx_atr(df, n=14)
+    adx, atr = compute_adx_atr(df, 14)
     adx_last = float(adx.dropna().iloc[-1]) if not adx.dropna().empty else np.nan
     atr_last = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else np.nan
-    atr_pct  = float(atr_last/close.iloc[-1]) if close.iloc[-1] != 0 else np.nan
+    atr_pct = float(atr_last/close.iloc[-1]) if close.iloc[-1] != 0 else np.nan
 
     r2 = trend_r2(close)
-
-    vol_s = df["Volume"].replace(0, np.nan).dropna()
-    vol_mean = float(vol_s.mean()) if not vol_s.empty else np.nan
 
     label = "Mixto"
     if pd.notna(adx_last) and pd.notna(r2):
@@ -315,243 +344,182 @@ def compute_metrics(df: pd.DataFrame, rule: str):
         elif adx_last <= 20 and r2 < 0.20:
             label = "Lateral"
 
+    vol_mean = float(df["Volume"].replace(0, np.nan).dropna().mean()) if df["Volume"].notna().any() else np.nan
+
     return {
         "Precio": float(close.iloc[-1]),
         "Retorno total": total_ret,
         "CAGR": cagr,
-        "Vol anualizada": vol_ann,
-        "Sharpe(~rf0)": sharpe,
+        "Vol anual": vol_ann,
+        "Sharpe": sharpe,
         "MaxDD": mdd,
-        "Avg rango %": avg_range,
-        "ATR14 %": atr_pct,
+        "Avg rango%": avg_range,
+        "ATR14%": atr_pct,
         "ADX14": adx_last,
         "R2": r2,
-        "Vol(prom)": vol_mean,
-        "Clasificación": label,
+        "Vol prom": vol_mean,
+        "Tipo": label,
         "Barras": int(len(close)),
         "Desde": close.index.min(),
         "Hasta": close.index.max(),
     }
 
-def week_metrics(df: pd.DataFrame, rule: str):
-    # semana actual (según timestamps en el archivo)
-    close = df["Close"].dropna()
-    if len(close) < 50:
-        return None
-    last_dt = close.index[-1]
-    week_start = (last_dt - pd.Timedelta(days=last_dt.weekday())).normalize()
-    w = df[df.index >= week_start]
-    if w.empty:
-        return None
-    w_close = w["Close"].dropna()
-    if len(w_close) < 2:
-        return None
-    ann = annualization_factor(rule)
-    w_ret = float(w_close.iloc[-1]/w_close.iloc[0] - 1)
-    w_range = float((w["High"].max() - w["Low"].min())/w_close.iloc[-1])
-    w_vol = float(w_close.pct_change().dropna().std()*np.sqrt(ann)) if len(w_close) > 3 else np.nan
-    w_volsum = float(w["Volume"].replace(0, np.nan).dropna().sum()) if w["Volume"].notna().any() else np.nan
-    return {"Retorno semana": w_ret, "Rango semana %": w_range, "Vol semana (ann)": w_vol, "Vol semana (suma)": w_volsum}
-
-def rolling_vol_peaks(close: pd.Series, win: int, top_n: int, ann_factor: int):
-    ret = close.pct_change().dropna()
-    if len(ret) < win + 50:
-        return None, None, None
-    roll = ret.rolling(win).std()*np.sqrt(ann_factor)
-    peaks = roll.dropna().nlargest(top_n)
-    table = pd.DataFrame({
-        "Fecha": peaks.index,
-        "Vol rolling (ann)": peaks.values,
-        "Ret 1": ret.reindex(peaks.index).values,
-        "Ret 5": close.pct_change(5).reindex(peaks.index).values,
-    })
-    return roll, peaks, table
-
 
 # ============================================================
-# Sidebar
+# 4) UI
 # ============================================================
-st.sidebar.header("📥 CSV MT5")
-uploads = st.sidebar.file_uploader("Sube CSV(s)", type=["csv", "txt"], accept_multiple_files=True)
+st.sidebar.header("CSV MT5")
+files = st.sidebar.file_uploader("Sube varios CSV", type=["csv","txt"], accept_multiple_files=True)
 
-st.sidebar.markdown("---")
-freq = st.sidebar.selectbox("Frecuencia (resample)", ["1min", "5min", "15min", "1H", "1D"], index=3)
-rule = {"1min":"1T", "5min":"5T", "15min":"15T", "1H":"1H", "1D":"1D"}[freq]
-ann = annualization_factor(rule)
+freq = st.sidebar.selectbox("Frecuencia (resample)", ["1min","5min","15min","1H","1D"], index=3)
+rule = {"1min":"1T","5min":"5T","15min":"15T","1H":"1H","1D":"1D"}[freq]
+ann = ann_factor(rule)
 
-roll_vol_days = st.sidebar.slider("Ventana vol rolling (días)", 1, 180, 30, 1)
-roll_corr_days = st.sidebar.slider("Ventana rolling corr (días)", 1, 365, 90, 1)
-top_dd_n = st.sidebar.selectbox("Top drawdowns", [3,5,10], index=1)
-top_peaks = st.sidebar.selectbox("Top picos vol", [5,10,20,30], index=1)
+roll_vol_days = st.sidebar.slider("Ventana vol rolling (días)", 1, 180, 30)
+roll_corr_days = st.sidebar.slider("Ventana rolling corr (días)", 1, 365, 90)
+top_dd = st.sidebar.selectbox("Top drawdowns", [3,5,10], index=1)
+top_peaks = st.sidebar.selectbox("Top picos vol", [5,10,20], index=1)
 
-# Convertir “días” a “barras” según frecuencia
-bars_per_day = {"1T":1440, "5T":288, "15T":96, "1H":24, "1D":1}[rule]
+bars_per_day = {"1T":1440,"5T":288,"15T":96,"1H":24,"1D":1}[rule]
 roll_vol_win = max(10, int(roll_vol_days * bars_per_day))
 roll_corr_win = max(10, int(roll_corr_days * bars_per_day))
 st.sidebar.caption(f"Equivalencia: vol={roll_vol_win} barras, corr={roll_corr_win} barras")
 
-if not uploads:
-    st.info("👈 Sube tus CSV de MT5. (Esto está hecho para tu formato real.)")
+if not files:
+    st.info("Sube tus CSV(s). Con este loader ya no debería existir el ‘Barras=0’.")
     st.stop()
 
-with st.sidebar.expander("🧷 Símbolo por archivo (si quieres cambiar)", expanded=False):
+# símbolo por archivo
+with st.sidebar.expander("Símbolo por archivo (opcional)", expanded=False):
     overrides = {}
-    for f in uploads:
+    for f in files:
         guess = infer_symbol_from_filename(f.name)
         sym = st.text_input(f.name, value=guess, key=f"sym_{f.name}")
         overrides[f.name] = sym.strip().upper()
 
-
-# ============================================================
-# Load / parse / resample
-# ============================================================
-series = {}
+# cargar
+raw_series: Dict[str, pd.DataFrame] = {}
 meta = []
-for f in uploads:
+for f in files:
     sym = overrides.get(f.name, infer_symbol_from_filename(f.name))
     b = f.getvalue()
-
-    raw, info = read_mt5_file(b)
-    if raw.empty:
-        meta.append({
-            "Archivo": f.name, "Símbolo": sym, "Barras": 0,
-            "Desde": "—", "Hasta": "—",
-            "Enc": info.get("encoding"), "Sep": info.get("sep"), "Nota": info.get("note")
-        })
+    df, info = load_and_prepare_bytes(b)
+    if df.empty:
+        meta.append({"Archivo": f.name, "Símbolo": sym, "Barras": 0, "Enc": info["encoding"], "Fmt": info["format"]})
         continue
-
-    raw.columns = [norm_col(c) for c in raw.columns]
-    ohlc = parse_mt5_ohlcv(raw)
-    rs = resample_ohlcv(ohlc, rule)
-
+    rs = resample_ohlcv(df, rule)
     if not rs.empty:
-        series[sym] = rs if sym not in series else (
-            pd.concat([series[sym], rs]).sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
+        raw_series[sym] = rs if sym not in raw_series else (
+            pd.concat([raw_series[sym], rs]).sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
         )
-
-    meta.append({
-        "Archivo": f.name, "Símbolo": sym,
-        "Barras": int(len(rs)),
-        "Desde": (rs.index.min().strftime("%Y-%m-%d %H:%M") if not rs.empty else "—"),
-        "Hasta": (rs.index.max().strftime("%Y-%m-%d %H:%M") if not rs.empty else "—"),
-        "Enc": info.get("encoding"),
-        "Sep": info.get("sep"),
-        "Nota": info.get("note", "")
-    })
+    meta.append({"Archivo": f.name, "Símbolo": sym, "Barras": int(len(rs)), "Enc": info["encoding"], "Fmt": info["format"]})
 
 st.subheader(f"Estado de carga (resample a {freq})")
 st.dataframe(pd.DataFrame(meta), use_container_width=True)
 
-if not series:
-    st.error("No se pudo parsear ningún archivo. En la tabla arriba se ve el encoding/sep detectado; eso indica qué raro trae el export.")
+if not raw_series:
+    st.error("No se pudo cargar ningún símbolo. Si aquí pasara, tu archivo NO empieza con <DATE> o trae un encoding rarísimo.")
     st.stop()
 
-symbols = sorted(series.keys())
-
-# Rango global
-gmin = min(series[s].index.min() for s in symbols)
-gmax = max(series[s].index.max() for s in symbols)
+symbols = sorted(raw_series.keys())
+gmin = min(raw_series[s].index.min() for s in symbols).date()
+gmax = max(raw_series[s].index.max() for s in symbols).date()
 
 st.sidebar.markdown("---")
-start = st.sidebar.date_input("Inicio", value=gmin.date())
-end   = st.sidebar.date_input("Fin", value=gmax.date())
+start = st.sidebar.date_input("Inicio", value=gmin)
+end   = st.sidebar.date_input("Fin", value=gmax)
 
-def slice_range(df):
-    m = (df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
-    return df.loc[m].copy()
+data = {}
+for s in symbols:
+    df = raw_series[s]
+    mask = (df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
+    data[s] = df.loc[mask].copy()
 
-data = {s: slice_range(series[s]) for s in symbols}
 symbols = [s for s in symbols if not data[s].empty]
-
 benchmark = st.sidebar.selectbox("Benchmark (estrés)", options=symbols, index=0)
 
-# ============================================================
-# Métricas + returns
-# ============================================================
-rows = []
+# métricas
+metrics_rows = []
+rets = {}
 week_rows = []
-rets_cols = {}
 
 for s in symbols:
     m = compute_metrics(data[s], rule)
     if m:
         m["Símbolo"] = s
-        rows.append(m)
-
-    wk = week_metrics(data[s], rule)
-    if wk:
-        wk["Símbolo"] = s
-        week_rows.append(wk)
+        metrics_rows.append(m)
 
     close = data[s]["Close"].dropna()
-    if len(close) >= 50:
-        rets_cols[s] = close.pct_change()
+    if len(close) >= 200:
+        rets[s] = close.pct_change()
 
-summary = pd.DataFrame(rows).set_index("Símbolo") if rows else pd.DataFrame()
+    # semanal
+    close2 = close
+    if len(close2) >= 50:
+        last_dt = close2.index[-1]
+        week_start = (last_dt - pd.Timedelta(days=last_dt.weekday())).normalize()
+        w = data[s].loc[data[s].index >= week_start]
+        if not w.empty and w["Close"].dropna().shape[0] >= 2:
+            w_close = w["Close"].dropna()
+            week_rows.append({
+                "Símbolo": s,
+                "Retorno semana": float(w_close.iloc[-1]/w_close.iloc[0] - 1),
+                "Rango semana %": float((w["High"].max() - w["Low"].min())/w_close.iloc[-1]),
+                "Vol semana (ann)": float(w_close.pct_change().dropna().std()*np.sqrt(ann)) if w_close.shape[0] > 3 else np.nan,
+                "Vol semana (suma)": float(w["Volume"].replace(0,np.nan).dropna().sum()) if w["Volume"].notna().any() else np.nan
+            })
+
+summary = pd.DataFrame(metrics_rows).set_index("Símbolo") if metrics_rows else pd.DataFrame()
 weekdf = pd.DataFrame(week_rows).set_index("Símbolo") if week_rows else pd.DataFrame()
-rets_df = pd.DataFrame(rets_cols)
+rets_df = pd.DataFrame(rets).dropna(how="any") if rets else pd.DataFrame()
 
-# ============================================================
-# Tabs
-# ============================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "✅ Resumen",
-    "🔍 Detalle + Drawdowns",
-    "🔗 Correlaciones",
-    "🌡 Estrés vs Calma",
-    "🧨 Eventos + Comparador",
-])
+# tabs
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["✅ Resumen", "🔍 Detalle+DD", "🔗 Correlaciones", "🌡 Estrés", "🧨 Eventos/Comparador"])
 
 with tab1:
     if summary.empty:
-        st.warning("Se cargó el CSV y hay barras, pero aún no alcanza el mínimo para métricas (~200 barras). Cambia a 1min/5min/15min o amplía rango.")
+        st.warning("Cargó bien, pero faltan barras para métricas (usa 1min/5min o amplía rango).")
     else:
-        st.subheader("Resumen por activo")
-        st.dataframe(summary.sort_values("Vol anualizada", ascending=False), use_container_width=True)
+        st.dataframe(summary.sort_values("Vol anual", ascending=False), use_container_width=True)
 
-    st.subheader("¿Qué pasó esta semana?")
+    st.subheader("Qué pasó esta semana")
     if not weekdf.empty:
         st.dataframe(weekdf, use_container_width=True)
     else:
-        st.info("No hay suficiente data para semana (depende del rango y frecuencia).")
+        st.info("No hay suficiente data para semana en el rango actual.")
 
 with tab2:
-    if not symbols:
-        st.info("Sin símbolos.")
-    else:
-        sym = st.selectbox("Símbolo", options=symbols, index=0)
-        close = data[sym]["Close"].dropna()
+    sym = st.selectbox("Símbolo", options=symbols, index=0)
+    close = data[sym]["Close"].dropna()
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=close.index, y=close.values, mode="lines"))
-        fig.update_layout(title=f"{sym} – Precio", height=320, margin=dict(l=20,r=20,t=50,b=20))
-        st.plotly_chart(fig, use_container_width=True)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=close.index, y=close.values, mode="lines"))
+    fig.update_layout(title=f"{sym} – Precio", height=320, margin=dict(l=20,r=20,t=50,b=20))
+    st.plotly_chart(fig, use_container_width=True)
 
-        dd = close/close.cummax()-1
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines"))
-        fig.update_layout(title=f"{sym} – Drawdown", height=240, margin=dict(l=20,r=20,t=50,b=20))
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+    dd = close/close.cummax()-1
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines"))
+    fig.update_layout(title=f"{sym} – Drawdown", height=240, margin=dict(l=20,r=20,t=50,b=20))
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
 
-        ev = drawdown_events(close)
-        st.markdown(f"### Top {top_dd_n} drawdowns (peak→trough)")
-        st.dataframe(ev.head(top_dd_n), use_container_width=True)
+    ev = drawdown_events(close)
+    st.markdown(f"### Top {top_dd} drawdowns (peak→trough)")
+    st.dataframe(ev.head(top_dd), use_container_width=True)
 
 with tab3:
-    cols = list(rets_df.columns)
-    if len(cols) < 2:
-        st.info("Para correlaciones necesitas 2+ símbolos con suficientes retornos (sube más archivos o amplía rango).")
+    if rets_df.empty or rets_df.shape[1] < 2:
+        st.info("Para correlación necesitas 2+ símbolos con suficientes barras (>=200).")
     else:
-        r = rets_df.dropna(how="any")
-        corr = r.corr()
-        st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Matriz de correlación"), use_container_width=True)
+        corr = rets_df.corr()
+        st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Correlación (retornos)"), use_container_width=True)
 
         colA, colB = st.columns(2)
-        a = colA.selectbox("A", options=cols, index=0)
-        b = colB.selectbox("B", options=cols, index=1)
+        a = colA.selectbox("A", options=list(rets_df.columns), index=0)
+        b = colB.selectbox("B", options=list(rets_df.columns), index=1)
         if a != b:
-            ab = pd.concat([r[a], r[b]], axis=1).dropna()
+            ab = rets_df[[a,b]].dropna()
             if len(ab) >= roll_corr_win + 50:
                 rc = ab[a].rolling(roll_corr_win).corr(ab[b])
                 fig = go.Figure()
@@ -560,19 +528,18 @@ with tab3:
                 fig.update_layout(title=f"Rolling Corr ({roll_corr_win} barras): {a} vs {b}", height=260, margin=dict(l=20,r=20,t=50,b=20))
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Poca data alineada para rolling corr con esa ventana. Baja la ventana o amplía rango.")
+                st.info("Poca data alineada para rolling corr con esa ventana.")
 
-        if SCIPY_OK and len(cols) >= 3:
+        if SCIPY_OK and rets_df.shape[1] >= 3:
             st.markdown("### Clustering (dendrograma)")
-            X = r[cols].T.values
-            fig = ff.create_dendrogram(X, labels=cols)
+            X = rets_df.T.values
+            fig = ff.create_dendrogram(X, labels=list(rets_df.columns))
             fig.update_layout(height=420, title="Clustering por comportamiento")
             st.plotly_chart(fig, use_container_width=True)
 
 with tab4:
-    cols = list(rets_df.columns)
-    if benchmark not in cols:
-        st.info("Benchmark no tiene retornos suficientes todavía (amplía rango o usa otra frecuencia).")
+    if rets_df.empty or benchmark not in rets_df.columns:
+        st.info("No hay retornos suficientes para estrés.")
     else:
         bret = rets_df[benchmark].dropna()
         vol = bret.rolling(roll_vol_win).std().dropna()
@@ -584,30 +551,29 @@ with tab4:
             reg[vol < q_low] = "Calm"
             reg[(vol >= q_low) & (vol < q_high)] = "Mid"
             reg[vol >= q_high] = "Stress"
+
             st.dataframe(reg.value_counts().to_frame("barras"), use_container_width=True)
 
-            r = rets_df.dropna(how="any")
             calm_idx = reg[reg=="Calm"].index
             stress_idx = reg[reg=="Stress"].index
 
-            r_calm = r.loc[r.index.intersection(calm_idx)]
-            r_stress = r.loc[r.index.intersection(stress_idx)]
+            r_calm = rets_df.loc[rets_df.index.intersection(calm_idx)]
+            r_stress = rets_df.loc[rets_df.index.intersection(stress_idx)]
+
             if len(r_calm) < 200 or len(r_stress) < 200:
-                st.info("Muy pocos puntos Calm/Stress para comparar correlación. Amplía rango.")
+                st.info("Muy pocos puntos Calm/Stress para comparar correlaciones.")
             else:
-                c_calm = r_calm.corr()
-                c_stress = r_stress.corr()
-                diff = (c_stress - c_calm).fillna(0)
+                diff = (r_stress.corr() - r_calm.corr()).fillna(0)
                 st.plotly_chart(px.imshow(diff, text_auto=".2f", aspect="auto", title="Stress - Calm"), use_container_width=True)
-                st.caption("Rojo = en estrés se alinean más. Azul = en estrés se desacoplan.")
 
 with tab5:
-    st.subheader("Picos de volatilidad (cualquier activo)")
+    st.subheader("Picos de volatilidad")
     sym = st.selectbox("Activo", options=symbols, index=0, key="pvol")
     close = data[sym]["Close"].dropna()
 
-    roll, peaks, table = rolling_vol_peaks(close, win=roll_vol_win, top_n=int(top_peaks), ann_factor=ann)
-    if roll is None:
+    roll = close.pct_change().dropna().rolling(roll_vol_win).std()*np.sqrt(ann)
+    peaks = roll.dropna().nlargest(int(top_peaks))
+    if peaks.empty:
         st.info("Poca historia para picos con esa ventana.")
     else:
         fig = go.Figure()
@@ -616,10 +582,10 @@ with tab5:
             fig.add_vline(x=d, line_dash="dash", opacity=0.35)
         fig.update_layout(title=f"{sym} – Vol rolling ({roll_vol_win} barras)", height=280, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(table, use_container_width=True)
+        st.dataframe(pd.DataFrame({"Fecha": peaks.index, "Vol": peaks.values}), use_container_width=True)
 
     st.markdown("---")
-    st.subheader("Comparador 2 activos (normalizado + ratio + volumen MA)")
+    st.subheader("Comparador 2 activos")
     col1, col2 = st.columns(2)
     a = col1.selectbox("A", options=symbols, index=0, key="cmpA")
     b = col2.selectbox("B", options=symbols, index=1 if len(symbols)>1 else 0, key="cmpB")
@@ -629,7 +595,7 @@ with tab5:
     df = dfA.join(dfB, how="inner").dropna(subset=["A_Close","B_Close"])
 
     if len(df) < 200:
-        st.info("No hay suficiente traslape entre ambos activos con el rango actual.")
+        st.info("No hay suficiente traslape entre ambos activos en el rango actual.")
     else:
         na = df["A_Close"]/df["A_Close"].iloc[0]
         nb = df["B_Close"]/df["B_Close"].iloc[0]
@@ -639,19 +605,4 @@ with tab5:
         fig.update_layout(title="Precio normalizado", height=280, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-        ratio = df["A_Close"]/df["B_Close"]
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df.index, y=ratio.values, mode="lines"))
-        fig.update_layout(title=f"Ratio {a}/{b}", height=240, margin=dict(l=20,r=20,t=50,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-        fig = go.Figure()
-        if df["A_Vol"].notna().any():
-            fig.add_trace(go.Scatter(x=df.index, y=df["A_Vol"].rolling(20).mean(), mode="lines", name=f"{a} Vol MA20"))
-        if df["B_Vol"].notna().any():
-            fig.add_trace(go.Scatter(x=df.index, y=df["B_Vol"].rolling(20).mean(), mode="lines", name=f"{b} Vol MA20"))
-        fig.update_layout(title="Volumen (MA20) usando TICKVOL", height=240, margin=dict(l=20,r=20,t=50,b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("---")
-st.caption("Si algo fallara, en 'Estado de carga' verás Encoding y Sep detectados. Esta versión está hecha para MT5 real.")
+st.caption("✅ Si tu analyzer parsea, este también: el loader es el mismo (usecols + datetime exacto + fallback whitespace/UTF-16).")
