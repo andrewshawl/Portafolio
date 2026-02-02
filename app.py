@@ -1,26 +1,39 @@
 import io
 import re
+import csv
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+# Clustering opcional sin matplotlib
 try:
+    from scipy.cluster.hierarchy import linkage
+    from scipy.spatial.distance import squareform
     import plotly.figure_factory as ff
     SCIPY_OK = True
 except Exception:
     SCIPY_OK = False
 
+
+# =========================
+# UI setup
+# =========================
 st.set_page_config(page_title="MT5 Portfolio Lab", page_icon="📈", layout="wide")
 st.title("📈 MT5 Portfolio Lab (MT5 CSV only)")
-st.caption("Sube CSV(s) de MT5. No Yahoo. No bloqueos. Todo el análisis corre con tus datos.")
+st.caption("Solo CSV exportados de MT5 (como <DATE> <TIME> <OPEN> ... <TICKVOL>). Sin Yahoo.")
 
-# ---------- CSV parsing (MT5 style) ----------
+# =========================
+# CSV parsing (robusto MT5)
+# =========================
 def norm_col(c: str) -> str:
-    c = str(c).strip().lower()
+    # "<DATE>" -> "date"
+    c = str(c).strip()
+    c = c.replace("\ufeff", "")  # BOM
+    c = c.lower()
     c = c.replace(" ", "_")
-    c = re.sub(r"[<>]", "", c)          # <DATE> -> date
+    c = re.sub(r"[<>]", "", c)
     c = re.sub(r"[^a-z0-9_]", "", c)
     return c
 
@@ -30,18 +43,60 @@ def infer_symbol_from_filename(name: str) -> str:
     base = re.split(r"[,\s;()\-]+", base)[0].upper()
     return base
 
-def read_csv_flexible(file_bytes: bytes) -> pd.DataFrame:
-    text = file_bytes.decode("utf-8", errors="ignore")
-    df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
-    df.columns = [norm_col(c) for c in df.columns]
-    return df
-
 def to_numeric(s: pd.Series) -> pd.Series:
     x = s.astype(str).str.replace(" ", "", regex=False)
+    # decimal coma si no hay punto
     mask = x.str.contains(",") & (~x.str.contains(r"\.", regex=True))
     x.loc[mask] = x.loc[mask].str.replace(",", ".", regex=False)
+    # quitar separador de miles
     x = x.str.replace(",", "", regex=False)
     return pd.to_numeric(x, errors="coerce")
+
+def read_mt5_csv(file_bytes: bytes) -> pd.DataFrame:
+    """
+    Lee CSV/tab/;/(whitespace) con headers tipo <DATE>.
+    """
+    text = file_bytes.decode("utf-8", errors="ignore")
+    sample = text[:4096]
+
+    # 1) Intentar sniffer con delimiters típicos
+    sniffed = None
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters="\t;,")
+        sniffed = dialect.delimiter
+    except Exception:
+        sniffed = None
+
+    tries = []
+    if sniffed:
+        tries.append(("sniff", sniffed))
+    tries += [("tab", "\t"), ("semi", ";"), ("comma", ","), ("ws", r"\s+")]
+
+    last_err = None
+    for name, sep in tries:
+        try:
+            if sep == r"\s+":
+                df = pd.read_csv(io.StringIO(text), sep=sep, engine="python")
+            else:
+                df = pd.read_csv(io.StringIO(text), sep=sep)
+            if df is None or df.empty:
+                continue
+            df.columns = [norm_col(c) for c in df.columns]
+            # si solo hay 1 columna, el separador no sirvió
+            if df.shape[1] < 5:
+                continue
+            return df
+        except Exception as e:
+            last_err = e
+            continue
+
+    # último recurso: engine python con sep=None
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        df.columns = [norm_col(c) for c in df.columns]
+        return df
+    except Exception:
+        raise RuntimeError(f"No pude leer CSV. Último error: {last_err}")
 
 def pick_col(cols: set, *cands):
     for c in cands:
@@ -49,10 +104,10 @@ def pick_col(cols: set, *cands):
             return c
     return None
 
-def parse_mt5(df: pd.DataFrame) -> pd.DataFrame:
+def parse_mt5_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """
     Soporta tu formato:
-    <DATE> <TIME> <OPEN> <HIGH> <LOW> <CLOSE> <TICKVOL> <VOL> <SPREAD>
+    date time open high low close tickvol vol spread
     """
     if df is None or df.empty:
         return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
@@ -63,22 +118,21 @@ def parse_mt5(df: pd.DataFrame) -> pd.DataFrame:
     time_col = pick_col(cols, "time")
     dt_col   = pick_col(cols, "datetime", "timestamp")
 
+    # datetime
     if dt_col is not None:
         dt = pd.to_datetime(df[dt_col], errors="coerce")
+    # DATE + TIME (tu caso)
     elif date_col is not None and time_col is not None:
-        dt = pd.to_datetime(df[date_col].astype(str) + " " + df[time_col].astype(str), errors="coerce")
+        combo = df[date_col].astype(str).str.strip() + " " + df[time_col].astype(str).str.strip()
+        # tu formato exacto: 2024.01.01 23:00:00
+        dt = pd.to_datetime(combo, format="%Y.%m.%d %H:%M:%S", errors="coerce")
+        # fallback por si algunos vienen raro
+        if dt.isna().mean() > 0.2:
+            dt = pd.to_datetime(combo, errors="coerce")
     elif date_col is not None:
         dt = pd.to_datetime(df[date_col], errors="coerce")
     else:
-        # último recurso: busca algo que contenga date o time
-        guess = None
-        for c in df.columns:
-            if "date" in c or "time" in c:
-                guess = c
-                break
-        if guess is None:
-            return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
-        dt = pd.to_datetime(df[guess], errors="coerce")
+        return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
 
     out = df.copy()
     out["_dt"] = dt
@@ -92,13 +146,13 @@ def parse_mt5(df: pd.DataFrame) -> pd.DataFrame:
     if c_close is None:
         return pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
 
-    o = pd.DataFrame(index=out["_dt"])
+    o = pd.DataFrame(index=pd.to_datetime(out["_dt"]).dt.tz_localize(None))
     o["Close"] = to_numeric(out[c_close])
     o["Open"]  = to_numeric(out[c_open]) if c_open else o["Close"]
     o["High"]  = to_numeric(out[c_high]) if c_high else o[["Open","Close"]].max(axis=1)
     o["Low"]   = to_numeric(out[c_low])  if c_low else o[["Open","Close"]].min(axis=1)
 
-    # volumen: tu CSV trae tickvol
+    # volumen: TICKVOL es lo que quieres
     c_vol = pick_col(cols, "tickvol", "tick_volume", "tickvolume", "real_volume", "volume", "vol")
     o["Volume"] = to_numeric(out[c_vol]) if c_vol else np.nan
 
@@ -121,7 +175,10 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     out = out.dropna(subset=["Close"])
     return out
 
-# ---------- Indicators ----------
+
+# =========================
+# Indicators / metrics
+# =========================
 def compute_adx_atr(df: pd.DataFrame, n=14):
     if df.empty or df["Close"].dropna().empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
@@ -166,6 +223,7 @@ def trend_r2(close: pd.Series):
     return float(r2), float(slope)
 
 def max_drawdown(close: pd.Series):
+    close = close.dropna()
     if close.empty:
         return np.nan
     dd = close/close.cummax() - 1
@@ -233,8 +291,10 @@ def drawdown_events(close: pd.Series) -> pd.DataFrame:
 
 def compute_metrics(df: pd.DataFrame):
     close = df["Close"].dropna()
-    rets  = close.pct_change().dropna()
+    if len(close) < 3:
+        return None
 
+    rets  = close.pct_change().dropna()
     days = (close.index[-1] - close.index[0]).days
     years = max(days/365.25, 1e-9)
 
@@ -242,6 +302,7 @@ def compute_metrics(df: pd.DataFrame):
     cagr = float((close.iloc[-1]/close.iloc[0])**(1/years) - 1) if close.iloc[0] > 0 else np.nan
     vol_ann = float(rets.std()*np.sqrt(252)) if len(rets) > 10 else np.nan
     sharpe  = float(cagr/vol_ann) if pd.notna(vol_ann) and vol_ann > 0 else np.nan
+
     mdd = max_drawdown(close)
 
     high = df["High"].fillna(close)
@@ -273,207 +334,154 @@ def compute_metrics(df: pd.DataFrame):
         "Vol anualizada": vol_ann,
         "Sharpe(~rf0)": sharpe,
         "MaxDD": mdd,
-        "Avg rango diario %": avg_range,
+        "Avg rango %": avg_range,
         "ATR14 %": atr_pct,
         "ADX14": adx_last,
         "R2 tendencia": float(r2) if pd.notna(r2) else np.nan,
-        "Volumen prom": vol_mean,
-        "Volumen último": vol_last,
+        "Vol prom": vol_mean,
+        "Vol último": vol_last,
         "Clasificación": label,
-        "Obs": int(len(close)),
-    }
-
-def week_metrics(df: pd.DataFrame):
-    close = df["Close"].dropna()
-    high  = df["High"].fillna(close)
-    low   = df["Low"].fillna(close)
-
-    last_dt = close.index[-1]
-    week_start = (last_dt - pd.Timedelta(days=last_dt.weekday())).normalize()
-    w = df[df.index >= week_start]
-    if w.empty:
-        w = df.tail(50)
-
-    w_close = w["Close"].dropna()
-    w_high = w["High"].fillna(w_close).dropna()
-    w_low  = w["Low"].fillna(w_close).dropna()
-
-    if len(w_close) < 2:
-        return None
-
-    w_ret = float(w_close.iloc[-1]/w_close.iloc[0] - 1)
-    w_range = float((w_high.max() - w_low.min())/w_close.iloc[-1])
-    w_vol = float(w_close.pct_change().dropna().std()*np.sqrt(252)) if len(w_close) > 3 else np.nan
-    w_volsum = float(w["Volume"].replace(0, np.nan).dropna().sum()) if w["Volume"].notna().any() else np.nan
-
-    return {
-        "Semana inicio": w_close.index[0].date(),
-        "Semana fin": w_close.index[-1].date(),
-        "Retorno semana": w_ret,
-        "Rango semana %": w_range,
-        "Vol semana (ann)": w_vol,
-        "Volumen semana (suma)": w_volsum,
+        "Barras": int(len(close)),
+        "Días": int((close.index.max().normalize() - close.index.min().normalize()).days) + 1
     }
 
 def rolling_vol_peaks(close: pd.Series, win: int, top_n: int):
     close = close.dropna()
     ret = close.pct_change().dropna()
-    if len(ret) < win + 10:
+    if len(ret) < win + 5:
         return None, None, None
     roll = ret.rolling(win).std()*np.sqrt(252)
     peaks = roll.dropna().nlargest(top_n)
     table = pd.DataFrame({
         "Fecha": peaks.index,
-        f"Vol rolling {win} barras (ann)": peaks.values,
-        "Retorno 1 barra": ret.reindex(peaks.index).values,
-        "Retorno 5 barras": close.pct_change(5).reindex(peaks.index).values,
+        "Vol rolling (ann)": peaks.values,
+        "Retorno 1": ret.reindex(peaks.index).values,
+        "Retorno 5": close.pct_change(5).reindex(peaks.index).values,
     })
     return roll, peaks, table
 
-# ---------- UI ----------
-st.sidebar.header("📥 Cargar CSV(s) de MT5")
-uploads = st.sidebar.file_uploader("CSV(s)", type=["csv", "txt"], accept_multiple_files=True)
+
+# =========================
+# Sidebar
+# =========================
+st.sidebar.header("📥 CSV MT5")
+uploads = st.sidebar.file_uploader("Sube CSV(s)", type=["csv", "txt"], accept_multiple_files=True)
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Frecuencia de análisis")
-freq_label = st.sidebar.selectbox(
-    "Analizar en",
-    ["Diario (1D)", "1H", "15min", "5min", "1min"],
-    index=0
-)
-freq_map = {"Diario (1D)": "1D", "1H": "1H", "15min": "15T", "5min": "5T", "1min": "1T"}
-RESAMPLE_RULE = freq_map[freq_label]
+st.sidebar.header("⏱ Frecuencia de análisis")
+freq = st.sidebar.selectbox("Resample", ["1min", "5min", "15min", "1H", "1D"], index=3)
+rule = {"1min":"1T", "5min":"5T", "15min":"15T", "1H":"1H", "1D":"1D"}[freq]
+bars_per_day = {"1T":1440, "5T":288, "15T":96, "1H":24, "1D":1}[rule]
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Parámetros (con sentido)")
-min_days = st.sidebar.slider(
-    "Mínimo de historia (días) para incluir un símbolo",
-    1, 365, 7, step=1,
-    help="Filtro de calidad: si un símbolo trae 1-2 días, te rompe CAGR/ADX/correlaciones. Baja esto solo para probar."
-)
+st.sidebar.header("📏 Ventanas (en DÍAS)")
+roll_vol_days = st.sidebar.slider("Ventana vol rolling (días)", 1, 180, 30, step=1)
+roll_corr_days = st.sidebar.slider("Ventana rolling corr (días)", 1, 365, 90, step=1)
+top_dd_n = st.sidebar.selectbox("Top drawdowns", [3,5,10], index=1)
 
-roll_vol_days = st.sidebar.slider(
-    "Ventana vol rolling (días)",
-    1, 180, 30, step=1,
-    help="Volatilidad móvil: últimos N días. Sirve para picos de volatilidad y para regímenes."
-)
-
-roll_corr_days = st.sidebar.slider(
-    "Ventana rolling corr (días)",
-    1, 365, 90, step=1,
-    help="Correlación móvil: cómo cambia la correlación con el tiempo."
-)
-
-top_dd_n = st.sidebar.selectbox("Top drawdowns por activo", [3,5,10], index=1)
+# Convertimos días a barras para la frecuencia elegida
+roll_vol_win = max(2, int(roll_vol_days * bars_per_day))
+roll_corr_win = max(2, int(roll_corr_days * bars_per_day))
+st.sidebar.caption(f"Equivalencia: vol={roll_vol_win} barras, corr={roll_corr_win} barras")
 
 if not uploads:
-    st.info("👈 Sube CSV(s) de MT5. Tu formato <DATE> <TIME> ... <TICKVOL> ya está soportado.")
+    st.info("👈 Sube tu CSV MT5. Tu formato <DATE><TIME><OPEN>...<TICKVOL> ya está soportado.")
     st.stop()
 
-# Overrides por archivo
-with st.sidebar.expander("🧷 Asignación de símbolo por archivo", expanded=False):
+# override de símbolo
+with st.sidebar.expander("🧷 Símbolo por archivo", expanded=False):
     overrides = {}
     for f in uploads:
         guess = infer_symbol_from_filename(f.name)
         sym = st.text_input(f.name, value=guess, key=f"sym_{f.name}")
         overrides[f.name] = sym.strip().upper()
 
-# Cargar series por símbolo
+# =========================
+# Load + parse
+# =========================
 series = {}
 meta = []
 for f in uploads:
     sym = overrides.get(f.name, infer_symbol_from_filename(f.name))
-    raw = read_csv_flexible(f.getvalue())
-    ohlcv = parse_mt5(raw)
-    rs = resample_ohlcv(ohlcv, RESAMPLE_RULE)
+    try:
+        raw = read_mt5_csv(f.getvalue())
+        ohlc = parse_mt5_ohlcv(raw)
+        rs = resample_ohlcv(ohlc, rule)
+    except Exception as e:
+        rs = pd.DataFrame(columns=["Open","High","Low","Close","Volume"])
 
     if not rs.empty:
-        series[sym] = rs if sym not in series else (
-            pd.concat([series[sym], rs]).sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
-        )
+        if sym in series:
+            comb = pd.concat([series[sym], rs]).sort_index()
+            comb = comb[~comb.index.duplicated(keep="last")]
+            series[sym] = comb
+        else:
+            series[sym] = rs
 
     meta.append({
         "Archivo": f.name,
         "Símbolo": sym,
         "Barras": int(len(rs)),
-        "Desde": (rs.index.min().date().isoformat() if not rs.empty else "—"),
-        "Hasta": (rs.index.max().date().isoformat() if not rs.empty else "—"),
-        "Vol (tickvol)": ("sí" if (not rs.empty and rs["Volume"].notna().any()) else "no/NA")
+        "Desde": (rs.index.min().strftime("%Y-%m-%d %H:%M") if not rs.empty else "—"),
+        "Hasta": (rs.index.max().strftime("%Y-%m-%d %H:%M") if not rs.empty else "—"),
     })
 
-st.subheader(f"Estado de carga (resample a {freq_label})")
+st.subheader(f"Estado de carga (resample a {freq})")
 st.dataframe(pd.DataFrame(meta), use_container_width=True)
 
-# Filtrar por historia mínima (días)
-def span_days(df):
-    if df.empty: return 0
-    return int((df.index.max().normalize() - df.index.min().normalize()).days) + 1
-
-symbols = [s for s, df in series.items() if span_days(df) >= min_days and len(df) >= 5]
-if not symbols:
-    st.error("No hay símbolos con suficiente historia. Baja 'mínimo de historia (días)' o sube más datos.")
+if not series:
+    st.error("No pude parsear ningún archivo. Confirma que el CSV tenga <DATE> <TIME> <OPEN> <HIGH> <LOW> <CLOSE>.")
     st.stop()
 
-# Rango global
+symbols = sorted(series.keys())
+# rango global
 gmin = min(series[s].index.min() for s in symbols)
 gmax = max(series[s].index.max() for s in symbols)
 
 st.sidebar.markdown("---")
-st.sidebar.header("🗓️ Rango de análisis")
-start_date = st.sidebar.date_input("Inicio", value=gmin.date())
-end_date   = st.sidebar.date_input("Fin", value=gmax.date())
+st.sidebar.header("🗓 Rango")
+start = st.sidebar.date_input("Inicio", value=gmin.date())
+end   = st.sidebar.date_input("Fin", value=gmax.date())
 
 def slice_range(df):
-    m = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
+    m = (df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1))
     return df.loc[m].copy()
 
 data = {s: slice_range(series[s]) for s in symbols}
-symbols = [s for s in symbols if not data[s].empty and span_days(data[s]) >= min_days]
+symbols = [s for s in symbols if not data[s].empty]
+
 if not symbols:
-    st.error("Con ese rango se quedó sin data suficiente. Ajusta fechas o baja mínimo.")
+    st.error("Con ese rango no quedó data.")
     st.stop()
 
-benchmark = st.sidebar.selectbox("Benchmark (para estrés)", options=symbols, index=0)
+benchmark = st.sidebar.selectbox("Benchmark (estrés)", options=symbols, index=0)
 
-# Convert days -> bars for rolling ops
-# Aproximación: número de barras por día según regla
-bars_per_day = {"1D": 1, "1H": 24, "15T": 96, "5T": 288, "1T": 1440}[RESAMPLE_RULE]
-roll_vol_win = max(2, int(roll_vol_days * bars_per_day))
-roll_corr_win = max(2, int(roll_corr_days * bars_per_day))
-
-st.sidebar.caption(f"Equivalencias: vol={roll_vol_win} barras, corr={roll_corr_win} barras (según {freq_label}).")
-
-# Métricas y returns
+# =========================
+# Metrics / returns
+# =========================
 rows = []
-week_rows = []
 rets_cols = {}
-
 for s in symbols:
-    df = data[s]
-    m = compute_metrics(df)
+    m = compute_metrics(data[s])
     if m:
         m["Símbolo"] = s
-        m["Hist (días)"] = span_days(df)
         rows.append(m)
 
-    w = week_metrics(df)
-    if w:
-        w["Símbolo"] = s
-        week_rows.append(w)
-
-    close = df["Close"].dropna()
-    if len(close) >= 10:
+    close = data[s]["Close"].dropna()
+    if len(close) >= 5:
         rets_cols[s] = close.pct_change()
 
 summary = pd.DataFrame(rows).set_index("Símbolo").sort_values("Vol anualizada", ascending=False)
-weekdf  = pd.DataFrame(week_rows).set_index("Símbolo") if week_rows else pd.DataFrame()
 rets_df = pd.DataFrame(rets_cols)
 
+# =========================
+# Tabs
+# =========================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "✅ Resumen",
     "🔍 Detalle + Drawdowns",
     "🔗 Correlaciones",
-    "🌡️ Estrés vs Calma",
+    "🌡 Estrés vs Calma",
     "🧨 Eventos + Comparador",
 ])
 
@@ -487,46 +495,21 @@ with tab1:
             "Vol anualizada":"{:.2%}",
             "Sharpe(~rf0)":"{:,.2f}",
             "MaxDD":"{:.2%}",
-            "Avg rango diario %":"{:.2%}",
+            "Avg rango %":"{:.2%}",
             "ATR14 %":"{:.2%}",
             "ADX14":"{:,.2f}",
             "R2 tendencia":"{:,.2f}",
-            "Volumen prom":"{:,.0f}",
-            "Volumen último":"{:,.0f}",
-            "Obs":"{:,.0f}",
+            "Vol prom":"{:,.0f}",
+            "Vol último":"{:,.0f}",
         }),
         use_container_width=True
     )
 
-    st.markdown("### ¿Qué pasó esta semana?")
-    if not weekdf.empty:
-        st.dataframe(
-            weekdf.style.format({
-                "Retorno semana":"{:.2%}",
-                "Rango semana %":"{:.2%}",
-                "Vol semana (ann)":"{:.2%}",
-                "Volumen semana (suma)":"{:,.0f}",
-            }),
-            use_container_width=True
-        )
-    else:
-        st.info("No hay suficiente data para tabla semanal.")
-
 with tab2:
-    st.subheader("Detalle por símbolo + Top drawdowns")
+    st.subheader("Detalle + drawdowns")
     sym = st.selectbox("Símbolo", options=list(summary.index), index=0)
-
     df = data[sym]
     close = df["Close"].dropna()
-
-    m = summary.loc[sym]
-    c1,c2,c3,c4,c5,c6 = st.columns(6)
-    c1.metric("Precio", f"{m['Precio']:,.6f}")
-    c2.metric("Ret total", f"{m['Retorno total']*100:,.2f}%")
-    c3.metric("Vol ann", f"{m['Vol anualizada']*100:,.2f}%" if pd.notna(m["Vol anualizada"]) else "—")
-    c4.metric("MaxDD", f"{m['MaxDD']*100:,.2f}%")
-    c5.metric("ADX14", f"{m['ADX14']:,.1f}" if pd.notna(m["ADX14"]) else "—")
-    c6.metric("Hist(d)", f"{int(m['Hist (días)'])}")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=close.index, y=close.values, mode="lines"))
@@ -541,25 +524,22 @@ with tab2:
     st.plotly_chart(fig, use_container_width=True)
 
     ev = drawdown_events(close)
-    st.markdown(f"### Top {top_dd_n} peores drawdowns (peak → trough)")
-    if ev.empty:
-        st.info("No se detectaron drawdowns (o muy poca historia).")
-    else:
-        st.dataframe(ev.head(top_dd_n), use_container_width=True)
+    st.markdown(f"### Top {top_dd_n} drawdowns (peak→trough)")
+    st.dataframe(ev.head(top_dd_n), use_container_width=True)
 
 with tab3:
     st.subheader("Correlación normal + Rolling Corr + Clustering")
-    valid_cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 10]
-    if len(valid_cols) < 2:
-        st.info("Necesitas al menos 2 símbolos con retornos suficientes.")
+    cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 20]
+    if len(cols) < 2:
+        st.info("Necesitas al menos 2 activos con retornos suficientes.")
     else:
-        r = rets_df[valid_cols].copy()
+        r = rets_df[cols].copy()
         corr = r.corr()
         st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Matriz de correlación"), use_container_width=True)
 
         colA, colB = st.columns(2)
-        a = colA.selectbox("A", options=valid_cols, index=0, key="A")
-        b = colB.selectbox("B", options=valid_cols, index=1, key="B")
+        a = colA.selectbox("A", options=cols, index=0)
+        b = colB.selectbox("B", options=cols, index=1)
         if a != b:
             ab = pd.concat([r[a], r[b]], axis=1).dropna()
             if len(ab) < roll_corr_win + 5:
@@ -572,21 +552,22 @@ with tab3:
                 fig.update_layout(title=f"Rolling Corr ({roll_corr_win} barras): {a} vs {b}", height=260, margin=dict(l=20,r=20,t=50,b=20))
                 st.plotly_chart(fig, use_container_width=True)
 
-        if SCIPY_OK and len(valid_cols) >= 3:
-            st.markdown("### Clustering (dendrograma)")
-            X = r.dropna().T.values  # activos como observaciones
-            fig = ff.create_dendrogram(X, labels=list(r.columns))
-            fig.update_layout(height=420)
+        if SCIPY_OK and len(cols) >= 3:
+            dist = np.sqrt(0.5*(1-corr.fillna(0)))
+            dist_cond = squareform(dist.values, checks=False)
+            Z = linkage(dist_cond, method="average")
+            fig = ff.create_dendrogram(dist.values, labels=list(corr.columns), linkagefun=lambda _: Z)
+            fig.update_layout(height=420, title="Dendrograma (distancia por correlación)")
             st.plotly_chart(fig, use_container_width=True)
 
 with tab4:
-    st.subheader("Estrés vs Calma (Calm/Mid/Stress) + Stress–Calm")
+    st.subheader("Estrés vs Calma (Calm/Mid/Stress) y Stress–Calm")
     if benchmark not in rets_df.columns or rets_df[benchmark].dropna().shape[0] < roll_vol_win + 10:
         st.info("Benchmark sin suficiente historia para regímenes con tu ventana. Baja ventana o amplía rango.")
     else:
         bench = rets_df[benchmark].dropna()
         vol = bench.rolling(roll_vol_win).std().dropna()
-        if len(vol) < 20:
+        if len(vol) < 30:
             st.info("No hay suficiente data para separar regímenes.")
         else:
             q_low, q_high = vol.quantile([0.40, 0.70])
@@ -597,8 +578,8 @@ with tab4:
 
             st.dataframe(reg.value_counts().to_frame("barras"), use_container_width=True)
 
-            valid_cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 20]
-            r = rets_df[valid_cols].copy()
+            cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 30]
+            r = rets_df[cols].copy()
 
             calm_idx = reg[reg=="Calm"].index
             stress_idx = reg[reg=="Stress"].index
@@ -606,7 +587,7 @@ with tab4:
             r_calm = r.loc[r.index.intersection(calm_idx)].dropna(how="any")
             r_stress = r.loc[r.index.intersection(stress_idx)].dropna(how="any")
 
-            if len(r_calm) < 10 or len(r_stress) < 10:
+            if len(r_calm) < 20 or len(r_stress) < 20:
                 st.info("Muy pocos puntos Calm/Stress para comparar correlaciones.")
             else:
                 c_calm = r_calm.corr()
@@ -651,7 +632,7 @@ with tab5:
         dfB = data[b][["Close","Volume"]].rename(columns={"Close":"B_Close","Volume":"B_Vol"})
         df = dfA.join(dfB, how="inner").dropna(subset=["A_Close","B_Close"])
 
-        if len(df) < 10:
+        if len(df) < 20:
             st.info("No hay suficiente traslape entre ambos activos.")
         else:
             norm_a = df["A_Close"]/df["A_Close"].iloc[0]
@@ -674,7 +655,7 @@ with tab5:
                 fig.add_trace(go.Scatter(x=df.index, y=df["A_Vol"].rolling(20).mean(), mode="lines", name=f"{a} Vol MA20"))
             if df["B_Vol"].notna().any():
                 fig.add_trace(go.Scatter(x=df.index, y=df["B_Vol"].rolling(20).mean(), mode="lines", name=f"{b} Vol MA20"))
-            fig.update_layout(title="Volumen (MA20) si existe", height=240, margin=dict(l=20,r=20,t=50,b=20))
+            fig.update_layout(title="Volumen (MA20) — usando TICKVOL", height=240, margin=dict(l=20,r=20,t=50,b=20))
             st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
