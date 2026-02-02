@@ -1,4 +1,16 @@
 # app.py
+# =========================================
+# Trading Lab – Streamlit Web App (robusta)
+# - Universo: básicos + extras (incluye EURUSD, BTC, XAUUSD, USOIL, US500, etc.)
+# - Descarga robusta con proxies estables (Yahoo)
+# - No se cae si fallan símbolos: sigue con los que sí
+# - Top N peores drawdowns por activo (peak->trough, fechas, duración)
+# - Volumen/volatilidad/recorrido/precio + lateral vs tendencial (ADX + R²)
+# - Correlaciones + rolling corr + clustering
+# - Regímenes Calm/Mid/Stress + Stress-Calm
+# - Oro vs Plata 5 años (volumen usando futuros GC=F / SI=F)
+# =========================================
+
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -6,12 +18,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
-# SciPy (para clustering). Si no está, no tronamos.
+# SciPy para clustering (si no está, no pasa nada)
 try:
     from scipy.cluster.hierarchy import linkage, dendrogram
     from scipy.spatial.distance import squareform
@@ -19,57 +30,57 @@ try:
 except Exception:
     SCIPY_OK = False
 
+# -----------------------------------------
+# CONFIG
+# -----------------------------------------
 st.set_page_config(page_title="Trading Lab", page_icon="📈", layout="wide")
-st.title("📈 Trading Lab – Dashboard Multi-Activos (MT5/Proxies)")
-st.caption("Fuente: Yahoo Finance (yfinance). Nota: en FX spot / algunos índices el volumen suele venir vacío o no ser volumen real.")
+st.title("📈 Trading Lab – Dashboard Multi-Activos (MT5 / Proxies)")
+st.caption(
+    "Fuente: Yahoo Finance (yfinance). "
+    "Nota: en FX spot / algunos índices, el 'volumen' puede venir vacío o no ser volumen real."
+)
 
-# ------------------------------------------------------------
-# UNIVERSO (BÁSICOS + EXTRAS)
-# ------------------------------------------------------------
-# Mapas/Proxies típicos:
-# EURUSD=X -> EURUSD
-# JPY=X -> USDJPY (Yahoo lo usa así)
-# CL=F -> USOIL/WTI (energía)
-# GC=F -> oro (XAUUSD)
-# SI=F -> plata (XAGUSD) (volumen real en futuros)
-# SPY o ^GSPC -> proxy US500
-# BTC-USD -> BTCUSD
-# ETH-USD -> ETHUSD
-# NQ=F o ^NDX -> Nasdaq100
-# ^VIX o VX=F -> VIX
-# DX-Y.NYB / DX=F / UUP -> DXY proxy
-
+# -----------------------------------------
+# UNIVERSO (MT5 símbolos + proxies Yahoo estables)
+# -----------------------------------------
+# Regla práctica:
+# - Índices: usa ETFs (SPY/QQQ) para OHLC confiable
+# - VIX: usa VXX (ETF) porque ^VIX puede fallar según región
+# - DXY: usa UUP (ETF) porque DXY a veces falla
+# - Oro/Plata: para OHLC+volumen usa futuros GC=F / SI=F
+# - USOIL: usa CL=F
+# - FX: usa los pares =X cuando existan (o CHF=X, JPY=X, MXN=X)
 ASSETS = {
     # ===== BÁSICOS =====
-    "EURUSD": {"aliases": ["EURUSD=X"], "mt5": "EURUSD"},
-    "USDJPY": {"aliases": ["JPY=X"], "mt5": "USDJPY"},
-    "XAUUSD (Oro)": {"aliases": ["XAUUSD=X", "GC=F"], "mt5": "XAUUSD"},
-    "USOIL / WTI": {"aliases": ["CL=F", "BZ=F"], "mt5": "USOIL"},
-    "US500 (SPX proxy)": {"aliases": ["SPY", "^GSPC", "ES=F"], "mt5": "US500"},
-    "BTCUSD": {"aliases": ["BTC-USD"], "mt5": "BTCUSD"},
+    "EURUSD": {"mt5": "EURUSD", "yahoo": ["EURUSD=X"]},
+    "USDJPY": {"mt5": "USDJPY", "yahoo": ["JPY=X"]},
+    "XAUUSD (Oro)": {"mt5": "XAUUSD", "yahoo": ["GC=F", "XAUUSD=X"]},     # preferimos futuros
+    "USOIL / WTI": {"mt5": "USOIL", "yahoo": ["CL=F", "BZ=F"]},
+    "US500 (proxy)": {"mt5": "US500", "yahoo": ["SPY", "^GSPC", "ES=F"]},
+    "BTCUSD": {"mt5": "BTCUSD", "yahoo": ["BTC-USD"]},
 
     # ===== EXTRAS QUE PEDISTE =====
-    "XAGUSD (Plata)": {"aliases": ["XAGUSD=X", "SI=F"], "mt5": "XAGUSD"},
-    "Nasdaq100": {"aliases": ["NQ=F", "^NDX", "QQQ"], "mt5": "NAS100"},
-    "USDCHF": {"aliases": ["CHF=X", "USDCHF=X"], "mt5": "USDCHF"},
-    "EURGBP": {"aliases": ["EURGBP=X"], "mt5": "EURGBP"},
-    "GBPUSD": {"aliases": ["GBPUSD=X"], "mt5": "GBPUSD"},
-    "VIX (Índice)": {"aliases": ["^VIX", "VX=F"], "mt5": "VIX"},
-    "USDMXN": {"aliases": ["MXN=X", "USDMXN=X"], "mt5": "USDMXN"},
-    "Ethereum": {"aliases": ["ETH-USD"], "mt5": "ETHUSD"},
-    "DXY (Índice USD)": {"aliases": ["DX-Y.NYB", "DX=F", "UUP", "^DXY"], "mt5": "DXY"},
-    "Copper (Cobre)": {"aliases": ["HG=F"], "mt5": "COPPER"},
-    "AUDCAD": {"aliases": ["AUDCAD=X"], "mt5": "AUDCAD"},
-    "NZDCAD": {"aliases": ["NZDCAD=X"], "mt5": "NZDCAD"},
+    "XAGUSD (Plata)": {"mt5": "XAGUSD", "yahoo": ["SI=F", "XAGUSD=X"]},   # preferimos futuros
+    "Nasdaq100": {"mt5": "NAS100", "yahoo": ["QQQ", "NQ=F", "^NDX"]},
+    "USDCHF": {"mt5": "USDCHF", "yahoo": ["CHF=X", "USDCHF=X"]},
+    "EURGBP": {"mt5": "EURGBP", "yahoo": ["EURGBP=X"]},
+    "GBPUSD": {"mt5": "GBPUSD", "yahoo": ["GBPUSD=X"]},
+    "VIX (proxy)": {"mt5": "VIX", "yahoo": ["VXX", "^VIX", "VX=F"]},
+    "USDMXN": {"mt5": "USDMXN", "yahoo": ["MXN=X", "USDMXN=X"]},
+    "Ethereum": {"mt5": "ETHUSD", "yahoo": ["ETH-USD"]},
+    "DXY (proxy)": {"mt5": "DXY", "yahoo": ["UUP", "DX-Y.NYB", "DX=F", "^DXY"]},
+    "Copper (Cobre)": {"mt5": "COPPER", "yahoo": ["HG=F"]},
+    "AUDCAD": {"mt5": "AUDCAD", "yahoo": ["AUDCAD=X"]},
+    "NZDCAD": {"mt5": "NZDCAD", "yahoo": ["NZDCAD=X"]},
 }
 
-# Para Oro vs Plata volumen real-ish: futuros
+# Para módulo Oro/Plata con volumen
 GOLD_FUT = "GC=F"
 SILV_FUT = "SI=F"
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+# -----------------------------------------
+# HELPERS
+# -----------------------------------------
 def _infer_dates(preset: str):
     today = date.today()
     if preset == "6M":  return today - timedelta(days=183), today
@@ -77,32 +88,36 @@ def _infer_dates(preset: str):
     if preset == "2Y":  return today - timedelta(days=365*2), today
     if preset == "5Y":  return today - timedelta(days=int(365.25*5)), today
     if preset == "10Y": return today - timedelta(days=int(365.25*10)), today
-    if preset == "MAX": return date(1990,1,1), today
+    if preset == "MAX": return date(1990, 1, 1), today
     return None, None
 
-@st.cache_data(ttl=60*60, show_spinner=False)
-def download_first_available(aliases, start, end, interval="1d"):
+@st.cache_data(ttl=3600, show_spinner=False)
+def download_first_working(aliases, start, end, interval="1d"):
+    """
+    Prueba aliases en orden y devuelve (df, ticker_usado).
+    df con columnas: Open, High, Low, Close, Volume
+    """
     for t in aliases:
         try:
-            df = yf.download(t, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
+            df = yf.download(t, start=start, end=end, interval=interval, auto_adjust=True, progress=False, threads=False)
             if df is None or df.empty:
                 continue
             df = df.copy()
-            for col in ["Open","High","Low","Close","Volume"]:
+            # normalizar columnas
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
                 if col not in df.columns:
                     df[col] = np.nan
-            df = df[["Open","High","Low","Close","Volume"]]
+            df = df[["Open", "High", "Low", "Close", "Volume"]]
             df.index = pd.to_datetime(df.index).tz_localize(None)
             df = df[~df.index.duplicated(keep="last")]
             df = df.dropna(subset=["Close"])
-            if len(df) >= 25:  # umbral flexible
-                return df, t
+            return df, t
         except Exception:
             continue
-    return pd.DataFrame(columns=["Open","High","Low","Close","Volume"]), None
+    return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]), None
 
 def compute_adx_atr(df, n=14):
-    if df.empty:
+    if df.empty or df["Close"].dropna().empty:
         return pd.Series(dtype=float), pd.Series(dtype=float)
 
     close = df["Close"].astype(float).copy()
@@ -113,7 +128,7 @@ def compute_adx_atr(df, n=14):
     down_move = -low.diff()
 
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
-    minus_dm= np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
     tr1 = (high - low).abs()
     tr2 = (high - close.shift()).abs()
@@ -122,15 +137,16 @@ def compute_adx_atr(df, n=14):
 
     atr = tr.ewm(alpha=1/n, adjust=False).mean()
     plus_dm_s = pd.Series(plus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean()
-    minus_dm_s= pd.Series(minus_dm,index=df.index).ewm(alpha=1/n, adjust=False).mean()
+    minus_dm_s = pd.Series(minus_dm, index=df.index).ewm(alpha=1/n, adjust=False).mean()
 
-    plus_di = 100*(plus_dm_s/atr.replace(0, np.nan))
-    minus_di= 100*(minus_dm_s/atr.replace(0, np.nan))
-    dx = 100*(plus_di - minus_di).abs()/(plus_di + minus_di).replace(0, np.nan)
+    plus_di = 100 * (plus_dm_s / atr.replace(0, np.nan))
+    minus_di = 100 * (minus_dm_s / atr.replace(0, np.nan))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.ewm(alpha=1/n, adjust=False).mean()
+
     return adx, atr
 
-def trend_r2(close):
+def trend_r2(close: pd.Series):
     close = close.dropna()
     if len(close) < 40:
         return np.nan, np.nan
@@ -138,34 +154,39 @@ def trend_r2(close):
     x = np.arange(len(y))
     slope, intercept = np.polyfit(x, y, 1)
     yhat = slope*x + intercept
-    ss_res = np.sum((y - yhat)**2)
-    ss_tot = np.sum((y - y.mean())**2)
-    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
-    return r2, slope
+    ss_res = np.sum((y - yhat) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+    return float(r2), float(slope)
 
-def max_drawdown(close):
+def max_drawdown(close: pd.Series):
     close = close.dropna()
     if close.empty:
         return np.nan
-    dd = close/close.cummax() - 1
+    dd = close / close.cummax() - 1
     return float(dd.min())
 
 def drawdown_events(close: pd.Series) -> pd.DataFrame:
+    """
+    Eventos drawdown: peak -> trough, y recovery si existe.
+    Ordenado de peor a mejor (más negativo primero).
+    """
     close = close.dropna()
     if close.empty:
         return pd.DataFrame()
 
     events = []
     peak_price = close.iloc[0]
-    peak_date  = close.index[0]
+    peak_date = close.index[0]
     trough_price = peak_price
-    trough_date  = peak_date
+    trough_date = peak_date
     in_dd = False
 
     for dt, price in close.iloc[1:].items():
         if price >= peak_price:
+            # recovery / nuevo máximo
             if in_dd:
-                dd_pct = trough_price/peak_price - 1
+                dd_pct = trough_price / peak_price - 1
                 events.append({
                     "Peak Date": peak_date,
                     "Trough Date": trough_date,
@@ -176,20 +197,21 @@ def drawdown_events(close: pd.Series) -> pd.DataFrame:
                 })
                 in_dd = False
             peak_price = price
-            peak_date  = dt
+            peak_date = dt
             trough_price = price
-            trough_date  = dt
+            trough_date = dt
         else:
             if not in_dd:
                 in_dd = True
                 trough_price = price
-                trough_date  = dt
+                trough_date = dt
             if price < trough_price:
                 trough_price = price
-                trough_date  = dt
+                trough_date = dt
 
+    # drawdown abierto
     if in_dd:
-        dd_pct = trough_price/peak_price - 1
+        dd_pct = trough_price / peak_price - 1
         events.append({
             "Peak Date": peak_date,
             "Trough Date": trough_date,
@@ -210,10 +232,10 @@ def drawdown_events(close: pd.Series) -> pd.DataFrame:
     ev["Days Trough->Recovery"] = (rec_filled - pd.to_datetime(ev["Trough Date"])).dt.days
     ev["Days Total"] = (rec_filled - pd.to_datetime(ev["Peak Date"])).dt.days
 
-    ev = ev.sort_values("Drawdown %").reset_index(drop=True)  # más negativo primero
+    ev = ev.sort_values("Drawdown %").reset_index(drop=True)
     return ev
 
-def compute_metrics(df):
+def compute_metrics(df: pd.DataFrame):
     if df.empty or df["Close"].dropna().empty:
         return None
 
@@ -221,22 +243,23 @@ def compute_metrics(df):
     rets = close.pct_change().dropna()
 
     days = (close.index[-1] - close.index[0]).days
-    years = max(days/365.25, 1e-9)
+    years = max(days / 365.25, 1e-9)
 
-    total_ret = float(close.iloc[-1]/close.iloc[0] - 1)
-    cagr = float((close.iloc[-1]/close.iloc[0])**(1/years) - 1) if close.iloc[0] > 0 else np.nan
-    vol_ann = float(rets.std()*np.sqrt(252)) if len(rets) > 10 else np.nan
-    sharpe = float(cagr/vol_ann) if (pd.notna(vol_ann) and vol_ann > 0) else np.nan
+    total_ret = float(close.iloc[-1] / close.iloc[0] - 1)
+    cagr = float((close.iloc[-1] / close.iloc[0]) ** (1 / years) - 1) if close.iloc[0] > 0 else np.nan
+    vol_ann = float(rets.std() * np.sqrt(252)) if len(rets) > 10 else np.nan
+    sharpe = float(cagr / vol_ann) if pd.notna(vol_ann) and vol_ann > 0 else np.nan
+
     mdd = max_drawdown(close)
 
     high = df["High"].fillna(close)
-    low  = df["Low"].fillna(close)
-    avg_range = float(((high - low).abs()/close).replace([np.inf,-np.inf], np.nan).dropna().mean())
+    low = df["Low"].fillna(close)
+    avg_range = float(((high - low).abs() / close).replace([np.inf, -np.inf], np.nan).dropna().mean())
 
     adx, atr = compute_adx_atr(df, n=14)
     adx_last = float(adx.dropna().iloc[-1]) if not adx.dropna().empty else np.nan
     atr_last = float(atr.dropna().iloc[-1]) if not atr.dropna().empty else np.nan
-    atr_pct  = float(atr_last/close.iloc[-1]) if (pd.notna(atr_last) and close.iloc[-1] != 0) else np.nan
+    atr_pct = float(atr_last / close.iloc[-1]) if pd.notna(atr_last) and close.iloc[-1] != 0 else np.nan
 
     r2, _ = trend_r2(close)
 
@@ -244,6 +267,7 @@ def compute_metrics(df):
     vol_mean = float(vol_s.mean()) if not vol_s.empty else np.nan
     vol_last = float(vol_s.iloc[-1]) if not vol_s.empty else np.nan
 
+    # Clasificación lateral/tendencial (regla práctica)
     label = "Mixto"
     if pd.notna(adx_last) and pd.notna(r2):
         if adx_last >= 25 and r2 >= 0.20:
@@ -268,29 +292,31 @@ def compute_metrics(df):
         "Obs": int(len(close)),
     }
 
-def week_metrics(df):
+def week_metrics(df: pd.DataFrame):
     if df.empty or df["Close"].dropna().empty:
         return None
+
     df = df.copy()
     df.index = pd.to_datetime(df.index).tz_localize(None)
 
     close = df["Close"].dropna()
     high = df["High"].fillna(close)
-    low  = df["Low"].fillna(close)
+    low = df["Low"].fillna(close)
 
     last_dt = close.index[-1]
     week_start = (last_dt - timedelta(days=last_dt.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+
     w = df[df.index >= week_start]
     if w.empty or w["Close"].dropna().empty:
         w = df.tail(5)
 
     w_close = w["Close"].dropna()
     w_high = w["High"].fillna(w_close).dropna()
-    w_low  = w["Low"].fillna(w_close).dropna()
+    w_low = w["Low"].fillna(w_close).dropna()
 
-    w_ret = float(w_close.iloc[-1]/w_close.iloc[0] - 1) if len(w_close) >= 2 else np.nan
-    w_range = float((w_high.max() - w_low.min())/w_close.iloc[-1]) if len(w_close) >= 2 else np.nan
-    w_vol = float(w_close.pct_change().dropna().std()*np.sqrt(252)) if len(w_close) > 3 else np.nan
+    w_ret = float(w_close.iloc[-1] / w_close.iloc[0] - 1) if len(w_close) >= 2 else np.nan
+    w_range = float((w_high.max() - w_low.min()) / w_close.iloc[-1]) if len(w_close) >= 2 else np.nan
+    w_vol = float(w_close.pct_change().dropna().std() * np.sqrt(252)) if len(w_close) > 3 else np.nan
 
     vol_s = w["Volume"].replace(0, np.nan).dropna()
     w_volsum = float(vol_s.sum()) if not vol_s.empty else np.nan
@@ -304,33 +330,40 @@ def week_metrics(df):
         "Volumen semana (suma)": w_volsum,
     }
 
-def pctfmt(x): return f"{x*100:,.2f}%" if pd.notna(x) else "—"
-def numfmt(x, d=2): return f"{x:,.{d}f}" if pd.notna(x) else "—"
-def csv_bytes(df): return df.to_csv(index=True).encode("utf-8-sig")
+def csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=True).encode("utf-8-sig")
 
-# ------------------------------------------------------------
-# Sidebar
-# ------------------------------------------------------------
+# -----------------------------------------
+# SIDEBAR
+# -----------------------------------------
 st.sidebar.header("⚙️ Configuración")
 
-all_names = list(ASSETS.keys())
-# default: básicos + algunos extras comunes
-default = ["EURUSD","USDJPY","XAUUSD (Oro)","USOIL / WTI","US500 (SPX proxy)","BTCUSD","Nasdaq100","USDMXN","DXY (Índice USD)","VIX (Índice)"]
+all_assets = list(ASSETS.keys())
 
-selected_assets = st.sidebar.multiselect("Activos", options=all_names, default=[x for x in default if x in all_names])
+default_assets = [
+    "EURUSD", "USDJPY", "XAUUSD (Oro)", "USOIL / WTI", "US500 (proxy)", "BTCUSD",
+    "Nasdaq100", "USDMXN", "DXY (proxy)", "VIX (proxy)", "XAGUSD (Plata)", "Ethereum"
+]
+default_assets = [a for a in default_assets if a in all_assets]
 
-preset = st.sidebar.selectbox("Periodo", ["6M","1Y","2Y","5Y","10Y","MAX","Custom"], index=3)
-if preset == "Custom":
+selected_assets = st.sidebar.multiselect(
+    "Activos",
+    options=all_assets,
+    default=default_assets
+)
+
+period = st.sidebar.selectbox("Periodo", ["6M", "1Y", "2Y", "5Y", "10Y", "MAX", "Custom"], index=3)
+if period == "Custom":
     c1, c2 = st.sidebar.columns(2)
-    start_date = c1.date_input("Inicio", value=date.today()-timedelta(days=int(365.25*5)))
-    end_date   = c2.date_input("Fin", value=date.today())
+    start_date = c1.date_input("Inicio", value=date.today() - timedelta(days=int(365.25 * 5)))
+    end_date = c2.date_input("Fin", value=date.today())
 else:
-    start_date, end_date = _infer_dates(preset)
+    start_date, end_date = _infer_dates(period)
 
-min_rows = st.sidebar.slider("Mínimo de velas por activo", 15, 120, 25, step=5)
-top_dd_n = st.sidebar.selectbox("Top drawdowns por activo", [3,5,10], index=1)
+min_rows = st.sidebar.slider("Mínimo de velas (para contar como válido)", 10, 150, 25, step=5)
+top_dd_n = st.sidebar.selectbox("Top drawdowns por activo", [3, 5, 10], index=1)
 roll_vol_win = st.sidebar.slider("Ventana vol rolling (días)", 10, 90, 30, step=5)
-roll_corr_win= st.sidebar.slider("Ventana corr rolling (días)", 30, 180, 90, step=10)
+roll_corr_win = st.sidebar.slider("Ventana corr rolling (días)", 30, 180, 90, step=10)
 
 if not selected_assets:
     st.warning("Selecciona al menos 1 activo.")
@@ -338,69 +371,98 @@ if not selected_assets:
 
 benchmark = st.sidebar.selectbox("Benchmark para regímenes", options=selected_assets, index=0)
 
-# ------------------------------------------------------------
-# Download
-# ------------------------------------------------------------
+with st.sidebar.expander("🧩 Notas rápidas"):
+    st.write(
+        "- US500/NAS100/VIX/DXY aquí son proxies (SPY/QQQ/VXX/UUP) para tener OHLC estable.\n"
+        "- Oro/Plata se bajan como futuros (GC=F / SI=F) para que sí exista volumen.\n"
+        "- Si Yahoo rate-limitea, recarga o usa un periodo más largo."
+    )
+
+# -----------------------------------------
+# DESCARGA
+# -----------------------------------------
 with st.spinner("Bajando datos (Yahoo) y calculando..."):
     data = {}
-    meta = []
+    meta_rows = []
+
     for a in selected_assets:
-        df, used = download_first_available(ASSETS[a]["aliases"], start_date, end_date, interval="1d")
+        df, used = download_first_working(ASSETS[a]["yahoo"], start_date, end_date, interval="1d")
         data[a] = df
-        meta.append({"Activo": a, "MT5": ASSETS[a]["mt5"], "Yahoo usado": used if used else "N/A", "Filas": len(df)})
+        meta_rows.append({
+            "Activo": a,
+            "MT5": ASSETS[a]["mt5"],
+            "Yahoo usado": used if used else "N/A",
+            "Filas": int(len(df)) if df is not None else 0
+        })
 
-meta_df = pd.DataFrame(meta)
+meta_df = pd.DataFrame(meta_rows)
 
-# Filtra los activos con data suficiente
-ok_assets = [a for a in selected_assets if (data[a] is not None and len(data[a]) >= min_rows)]
+# Clasificar válidos vs fallidos
+ok_assets = [a for a in selected_assets if data[a] is not None and len(data[a]) >= min_rows and not data[a].empty]
 failed_assets = [a for a in selected_assets if a not in ok_assets]
 
 if failed_assets:
-    st.warning("Algunos símbolos no bajaron bien de Yahoo (o el periodo fue muy corto). Sigo con los que sí.")
+    st.warning("Algunos símbolos no bajaron bien de Yahoo. Sigo con los que sí (abajo te dejo cuáles fallaron).")
     st.dataframe(meta_df[meta_df["Activo"].isin(failed_assets)], use_container_width=True)
 
-if len(ok_assets) < 2:
-    st.error("Muy pocos activos con datos suficientes. Prueba periodo más largo (2Y/5Y) o quita DXY/VIX primero.")
+if len(ok_assets) == 0:
+    st.error("No bajó data suficiente para ningún activo. Prueba: periodo 5Y / 10Y o reduce la lista.")
     st.stop()
 
-# Si benchmark falló, escoger otro
 if benchmark not in ok_assets:
     benchmark = ok_assets[0]
-    st.info(f"Benchmark no tenía datos suficientes; usé {benchmark} como referencia.")
+    st.info(f"El benchmark elegido no tuvo data suficiente; uso {benchmark} como referencia.")
 
-# Métricas
-rows, week_rows = [], []
+# -----------------------------------------
+# MÉTRICAS
+# -----------------------------------------
+rows = []
+week_rows = []
+
 for a in ok_assets:
-    df = data[a]
-    m = compute_metrics(df)
+    m = compute_metrics(data[a])
     if m is None:
         continue
     m["Activo"] = a
     m["MT5"] = ASSETS[a]["mt5"]
-    m["Yahoo usado"] = meta_df.loc[meta_df["Activo"]==a, "Yahoo usado"].iloc[0]
+    m["Yahoo usado"] = meta_df.loc[meta_df["Activo"] == a, "Yahoo usado"].iloc[0]
     rows.append(m)
 
-    w = week_metrics(df)
+    w = week_metrics(data[a])
     if w is not None:
         w["Activo"] = a
         week_rows.append(w)
 
-summary = pd.DataFrame(rows).set_index("Activo").sort_values("Vol anualizada", ascending=False)
-weekdf  = pd.DataFrame(week_rows).set_index("Activo") if week_rows else pd.DataFrame()
+summary = pd.DataFrame(rows).set_index("Activo") if rows else pd.DataFrame()
+weekdf = pd.DataFrame(week_rows).set_index("Activo") if week_rows else pd.DataFrame()
 
-# Retornos matrix
-rets = {}
+if summary.empty:
+    st.error("Se bajó data pero no se pudieron calcular métricas. Intenta con otros símbolos/periodo.")
+    st.stop()
+
+summary = summary.sort_values("Vol anualizada", ascending=False)
+
+# returns matrix (NO dropna global para que no mate correlación)
+rets_df = pd.DataFrame()
 for a in ok_assets:
-    c = data[a]["Close"].dropna()
-    if len(c) >= 40:
-        rets[a] = c.pct_change().dropna()
-rets_df = pd.concat(rets, axis=1).dropna(how="any") if len(rets) else pd.DataFrame()
+    close = data[a]["Close"].dropna()
+    if len(close) >= 30:
+        rets_df[a] = close.pct_change()
 
-# ------------------------------------------------------------
-# Tabs
-# ------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["✅ Resumen", "🔍 Detalle + Drawdowns", "🔗 Correlaciones", "🌡️ Regímenes", "🥇 Oro vs Plata"])
+# -----------------------------------------
+# TABS
+# -----------------------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "✅ Resumen",
+    "🔍 Detalle + Drawdowns",
+    "🔗 Correlaciones",
+    "🌡️ Regímenes",
+    "🥇 Oro vs Plata"
+])
 
+# =========================
+# TAB 1: Resumen
+# =========================
 with tab1:
     st.subheader("Mapa de símbolos (MT5 vs Yahoo)")
     st.dataframe(meta_df[meta_df["Activo"].isin(ok_assets)], use_container_width=True)
@@ -432,16 +494,18 @@ with tab1:
     c1, c2, c3 = st.columns(3)
     with c1:
         st.write("🔥 Más volátiles")
-        st.dataframe(summary["Vol anualizada"].head(7).to_frame("Vol anualizada"), use_container_width=True)
+        st.dataframe(summary["Vol anualizada"].sort_values(ascending=False).head(7).to_frame("Vol"), use_container_width=True)
     with c2:
         st.write("💰 Más 'rentables' (CAGR)")
         st.dataframe(summary["CAGR"].sort_values(ascending=False).head(7).to_frame("CAGR"), use_container_width=True)
     with c3:
-        st.write("⚖️ Mejor Sharpe (rf~0)")
+        st.write("⚖️ Mejor Sharpe (~rf0)")
         st.dataframe(summary["Sharpe (~rf0)"].sort_values(ascending=False).head(7).to_frame("Sharpe"), use_container_width=True)
 
-    st.markdown("### Lateral vs Tendencial (regla práctica: ADX + R²)")
-    cls = summary[["Clasificación","ADX14","R2 tendencia","Retorno total","Vol anualizada","ATR14 %","Avg rango diario %"]].sort_values(["Clasificación","ADX14"], ascending=[True, False])
+    st.markdown("### Lateral vs Tendencial (ADX + R²)")
+    cls = summary[["Clasificación","ADX14","R2 tendencia","Retorno total","Vol anualizada","ATR14 %","Avg rango diario %"]].sort_values(
+        ["Clasificación","ADX14"], ascending=[True, False]
+    )
     st.dataframe(cls, use_container_width=True)
 
     st.markdown("### ¿Qué pasó esta semana?")
@@ -458,33 +522,39 @@ with tab1:
     else:
         st.info("No se pudo armar tabla semanal con lo descargado.")
 
+    st.markdown("### Descargar")
     st.download_button("⬇️ Descargar resumen (CSV)", data=csv_bytes(summary), file_name="summary.csv", mime="text/csv")
     if not weekdf.empty:
         st.download_button("⬇️ Descargar semanal (CSV)", data=csv_bytes(weekdf), file_name="weekly.csv", mime="text/csv")
 
+# =========================
+# TAB 2: Detalle + Drawdowns
+# =========================
 with tab2:
     st.subheader("Detalle por activo + Top drawdowns (peak → trough)")
     asset = st.selectbox("Elige un activo", options=list(summary.index), index=0)
+
     df = data[asset]
     close = df["Close"].dropna()
 
     m = summary.loc[asset]
     a1,a2,a3,a4,a5,a6 = st.columns(6)
-    a1.metric("Precio", numfmt(m["Precio"],4))
-    a2.metric("Retorno total", pctfmt(m["Retorno total"]))
-    a3.metric("Vol anual", pctfmt(m["Vol anualizada"]))
-    a4.metric("MaxDD", pctfmt(m["MaxDD"]))
-    a5.metric("ADX14", numfmt(m["ADX14"],1))
+    a1.metric("Precio", f"{m['Precio']:,.4f}")
+    a2.metric("Retorno total", f"{m['Retorno total']*100:,.2f}%")
+    a3.metric("Vol anual", f"{m['Vol anualizada']*100:,.2f}%" if pd.notna(m["Vol anualizada"]) else "—")
+    a4.metric("MaxDD", f"{m['MaxDD']*100:,.2f}%")
+    a5.metric("ADX14", f"{m['ADX14']:,.1f}" if pd.notna(m["ADX14"]) else "—")
     a6.metric("Clasificación", str(m["Clasificación"]))
 
     st.caption(f"MT5: {ASSETS[asset]['mt5']} | Yahoo: {m['Yahoo usado']} | Obs: {m['Obs']}")
 
+    # Precio
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=close.index, y=close.values, mode="lines", name="Close"))
     fig.update_layout(title=f"{asset} – Precio", height=360, margin=dict(l=20,r=20,t=50,b=20))
     st.plotly_chart(fig, use_container_width=True)
 
-    # rolling vol
+    # Vol rolling
     ret = close.pct_change().dropna()
     if len(ret) > roll_vol_win + 10:
         rv = ret.rolling(roll_vol_win).std()*np.sqrt(252)
@@ -493,7 +563,7 @@ with tab2:
         fig.update_layout(title=f"{asset} – Vol rolling {roll_vol_win}d (ann)", height=280, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-    # drawdown curve
+    # Drawdown curve
     dd = close/close.cummax()-1
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines", name="Drawdown"))
@@ -501,7 +571,7 @@ with tab2:
     fig.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig, use_container_width=True)
 
-    # top dd events
+    # Top drawdown events
     ev = drawdown_events(close)
     st.markdown(f"### 🧨 Top {top_dd_n} peores drawdowns históricos")
     if ev.empty:
@@ -510,54 +580,89 @@ with tab2:
         top_ev = ev.head(top_dd_n).copy()
         show_ev = top_ev[["Peak Date","Trough Date","Recovery Date","Drawdown %","Days Peak->Trough","Days Trough->Recovery","Days Total","Peak Price","Trough Price"]]
         try:
-            st.dataframe(show_ev.style.format({"Drawdown %":"{:.2%}","Peak Price":"{:,.4f}","Trough Price":"{:,.4f}"}), use_container_width=True)
+            st.dataframe(show_ev.style.format({
+                "Drawdown %":"{:.2%}",
+                "Peak Price":"{:,.4f}",
+                "Trough Price":"{:,.4f}",
+            }), use_container_width=True)
         except Exception:
             st.dataframe(show_ev, use_container_width=True)
 
         st.download_button("⬇️ Descargar todos los drawdowns (CSV)", data=csv_bytes(ev), file_name=f"drawdowns_{asset}.csv", mime="text/csv")
 
-with tab3:
-    st.subheader("Correlaciones + Rolling Corr + (opcional) Clustering")
-    if rets_df.empty or rets_df.shape[1] < 2:
-        st.info("No hay suficientes activos con retornos alineados.")
+    # Volumen
+    vol_s = df["Volume"].replace(0, np.nan).dropna()
+    st.markdown("### Volumen")
+    if vol_s.empty:
+        st.info("Volumen: N/A (normal en FX spot / proxies).")
     else:
-        corr = rets_df.corr()
-        st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Matriz de correlación"), use_container_width=True)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=vol_s.index, y=vol_s.values, name="Volume"))
+        fig.update_layout(title=f"{asset} – Volumen", height=260, margin=dict(l=20,r=20,t=50,b=20))
+        st.plotly_chart(fig, use_container_width=True)
 
-        c1, c2 = st.columns(2)
-        a = c1.selectbox("Activo A", options=list(rets_df.columns), index=0)
-        b = c2.selectbox("Activo B", options=list(rets_df.columns), index=min(1, len(rets_df.columns)-1))
+# =========================
+# TAB 3: Correlaciones
+# =========================
+with tab3:
+    st.subheader("Correlaciones + Rolling Corr + Clustering")
+    # necesitamos al menos 2 series de retornos con datos
+    valid_cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 30]
+
+    if len(valid_cols) < 2:
+        st.info("Para correlaciones necesitas al menos 2 activos con retornos suficientes. (Los otros tabs sí sirven).")
+    else:
+        r = rets_df[valid_cols].copy()
+        corr = r.corr(min_periods=60)
+
+        st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Matriz de correlación (pairwise)"), use_container_width=True)
+
+        st.markdown("### Rolling correlation (elige par)")
+        colA, colB = st.columns(2)
+        a = colA.selectbox("Activo A", options=valid_cols, index=0)
+        b = colB.selectbox("Activo B", options=valid_cols, index=1 if len(valid_cols) > 1 else 0)
+
         if a != b:
-            rc = rets_df[a].rolling(roll_corr_win).corr(rets_df[b])
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=rc.index, y=rc.values, mode="lines"))
-            fig.add_hline(y=0)
-            fig.update_layout(title=f"Rolling Corr ({roll_corr_win}d): {a} vs {b}", height=300, margin=dict(l=20,r=20,t=50,b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            ab = pd.concat([r[a], r[b]], axis=1).dropna()
+            if len(ab) < roll_corr_win + 30:
+                st.info("Muy pocos datos alineados para rolling corr con esa ventana. Baja la ventana o usa periodo más largo.")
+            else:
+                rc = ab[a].rolling(roll_corr_win).corr(ab[b])
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=rc.index, y=rc.values, mode="lines"))
+                fig.add_hline(y=0)
+                fig.update_layout(title=f"Rolling Corr ({roll_corr_win}d): {a} vs {b}", height=300, margin=dict(l=20,r=20,t=50,b=20))
+                st.plotly_chart(fig, use_container_width=True)
 
-        if SCIPY_OK and rets_df.shape[1] >= 3:
-            dist = np.sqrt(0.5*(1-corr))
+        st.markdown("### Clustering (opcional)")
+        if SCIPY_OK and len(valid_cols) >= 3:
+            corr2 = r.corr(min_periods=60).fillna(0)
+            dist = np.sqrt(0.5*(1-corr2))
             dist_cond = squareform(dist.values, checks=False)
             Z = linkage(dist_cond, method="average")
 
             import matplotlib.pyplot as plt
             fig2 = plt.figure(figsize=(12,4))
-            dendrogram(Z, labels=corr.columns)
+            dendrogram(Z, labels=corr2.columns)
             plt.title("Clustering jerárquico (distancia por correlación)")
             st.pyplot(fig2, clear_figure=True)
         else:
-            st.info("Clustering requiere SciPy y al menos 3 activos con data suficiente.")
+            st.info("Clustering requiere SciPy y al menos 3 activos con retornos suficientes.")
 
+# =========================
+# TAB 4: Regímenes
+# =========================
 with tab4:
     st.subheader("Regímenes Calm / Mid / Stress (según vol del benchmark)")
-    if benchmark not in rets_df.columns:
-        st.info("Benchmark no tiene retornos alineados suficientes.")
+
+    if benchmark not in rets_df.columns or rets_df[benchmark].dropna().shape[0] < 120:
+        st.info("Benchmark no tiene historia suficiente para regímenes. Usa periodo 2Y/5Y o cambia benchmark.")
     else:
         bench = rets_df[benchmark].dropna()
         win = 30
         vol = bench.rolling(win).std().dropna()
-        if len(vol) < 100:
-            st.info("No hay suficiente historia para separar regímenes.")
+        if len(vol) < 120:
+            st.info("No hay suficiente historia para separar regímenes con esa ventana.")
         else:
             q_low, q_high = vol.quantile([0.40, 0.70])
             reg = pd.Series(index=vol.index, dtype="object")
@@ -565,40 +670,54 @@ with tab4:
             reg[(vol >= q_low) & (vol < q_high)] = "Mid"
             reg[vol >= q_high] = "Stress"
 
+            st.write("Conteo por régimen:")
             st.dataframe(reg.value_counts().to_frame("días"), use_container_width=True)
 
-            aligned = rets_df.loc[reg.index].dropna(how="any")
-
-            def corr_reg(label):
-                idx = aligned.index.intersection(reg[reg==label].index)
-                if len(idx) < 40:
-                    return None
-                return aligned.loc[idx].corr()
-
-            c_calm = corr_reg("Calm")
-            c_stress = corr_reg("Stress")
-            if c_calm is None or c_stress is None:
-                st.info("No hay suficientes días Calm/Stress con retornos alineados.")
+            # Para correlaciones por régimen necesitamos varios activos con retornos
+            valid_cols = [c for c in rets_df.columns if rets_df[c].dropna().shape[0] >= 60]
+            if len(valid_cols) < 2:
+                st.info("No hay suficientes activos con retornos para comparar correlación por régimen.")
             else:
-                diff = c_stress - c_calm
-                st.plotly_chart(px.imshow(diff, text_auto=".2f", aspect="auto", title="Cambio de correlación: Stress - Calm"), use_container_width=True)
-                st.caption("Rojo = en estrés se alinean más. Azul = en estrés se desacoplan.")
+                r = rets_df[valid_cols].copy()
 
+                calm_idx = reg[reg == "Calm"].index
+                stress_idx = reg[reg == "Stress"].index
+
+                r_calm = r.loc[r.index.intersection(calm_idx)]
+                r_stress = r.loc[r.index.intersection(stress_idx)]
+
+                if r_calm.shape[0] < 60 or r_stress.shape[0] < 60:
+                    st.info("Muy pocos días Calm/Stress para comparar correlaciones. Usa 5Y o baja umbrales.")
+                else:
+                    c_calm = r_calm.corr(min_periods=60)
+                    c_stress = r_stress.corr(min_periods=60)
+                    diff = (c_stress - c_calm).fillna(0)
+
+                    st.plotly_chart(px.imshow(diff, text_auto=".2f", aspect="auto", title="Cambio de correlación: Stress - Calm"), use_container_width=True)
+                    st.caption("Rojo = en estrés se alinean más. Azul = en estrés se desacoplan.")
+
+# =========================
+# TAB 5: Oro vs Plata
+# =========================
 with tab5:
     st.subheader("Oro vs Plata (5 años) – precio + volumen (futuros)")
     st.caption("Para volumen usamos futuros: Oro (GC=F) y Plata (SI=F).")
 
     end = date.today()
-    start = end - timedelta(days=int(365.25*5)+10)
+    start = end - timedelta(days=int(365.25*5) + 10)
 
-    g, _ = download_first_available([GOLD_FUT], start, end)
-    s, _ = download_first_available([SILV_FUT], start, end)
+    g, g_used = download_first_working([GOLD_FUT], start, end)
+    s, s_used = download_first_working([SILV_FUT], start, end)
 
-    if g.empty or s.empty:
-        st.warning("No pude descargar GC=F o SI=F (Yahoo).")
+    if g.empty or s.empty or g["Close"].dropna().empty or s["Close"].dropna().empty:
+        st.warning("No pude descargar GC=F o SI=F (Yahoo). Intenta recargar o más tarde.")
     else:
-        df = pd.DataFrame({"Gold": g["Close"].dropna(), "Silver": s["Close"].dropna()}).dropna()
-        norm = df/df.iloc[0]
+        df = pd.DataFrame({
+            "Gold": g["Close"].dropna(),
+            "Silver": s["Close"].dropna()
+        }).dropna()
+
+        norm = df / df.iloc[0]
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=norm.index, y=norm["Gold"], mode="lines", name="Gold (norm)"))
@@ -606,7 +725,7 @@ with tab5:
         fig.update_layout(title="Precio normalizado (5 años)", height=340, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-        ratio = df["Gold"]/df["Silver"]
+        ratio = df["Gold"] / df["Silver"]
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=ratio.index, y=ratio.values, mode="lines"))
         fig.update_layout(title="Ratio Oro/Plata", height=260, margin=dict(l=20,r=20,t=50,b=20))
@@ -614,6 +733,7 @@ with tab5:
 
         gv = g["Volume"].replace(0, np.nan).dropna()
         sv = s["Volume"].replace(0, np.nan).dropna()
+
         fig = go.Figure()
         if not gv.empty:
             fig.add_trace(go.Scatter(x=gv.index, y=gv.rolling(20).mean(), mode="lines", name="Gold Vol MA20"))
@@ -621,6 +741,42 @@ with tab5:
             fig.add_trace(go.Scatter(x=sv.index, y=sv.rolling(20).mean(), mode="lines", name="Silver Vol MA20"))
         fig.update_layout(title="Volumen MA20 (futuros)", height=260, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
+
+        # Picos de volatilidad del oro
+        st.markdown("### ⚡ Momentos más volátiles del oro (GC=F)")
+        top_n = st.slider("Top N picos (oro)", 5, 20, 10, step=1)
+        win = st.slider("Ventana vol (oro)", 10, 90, 30, step=5)
+
+        g_close = g["Close"].dropna()
+        g_ret = g_close.pct_change().dropna()
+
+        if len(g_ret) > win + 60:
+            roll = g_ret.rolling(win).std() * np.sqrt(252)
+            peaks = roll.dropna().nlargest(top_n)
+
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=roll.index, y=roll.values, mode="lines", name="Vol rolling"))
+            for d in peaks.index:
+                fig.add_vline(x=d, line_dash="dash", opacity=0.5)
+            fig.update_layout(title=f"Oro – Vol rolling {win}d (picos marcados)", height=320, margin=dict(l=20,r=20,t=50,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+
+            table = pd.DataFrame({
+                "Fecha": peaks.index.date,
+                f"Vol rolling {win}d (ann)": peaks.values,
+                "Retorno 1d": g_ret.reindex(peaks.index).values,
+                "Retorno 5d": g_close.pct_change(5).reindex(peaks.index).values,
+            })
+            try:
+                st.dataframe(table.style.format({
+                    f"Vol rolling {win}d (ann)":"{:.2%}",
+                    "Retorno 1d":"{:.2%}",
+                    "Retorno 5d":"{:.2%}",
+                }), use_container_width=True)
+            except Exception:
+                st.dataframe(table, use_container_width=True)
+        else:
+            st.info("No hay suficiente historia para detectar picos con esa ventana.")
 
 st.markdown("---")
 st.caption("Disclaimer: análisis estadístico, no asesoría financiera.")
