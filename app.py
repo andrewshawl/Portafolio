@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+MT5 Portfolio Lab (CSV-only) — versión estable FINAL
+====================================================
+- Loader calcado del analyzer: detecta <DATE>, usecols, rename, to_datetime(..., utc=True)
+- Soporta TAB o espacios (fallback sep=r"\s+")
+- Soporta UTF-16 / UTF-8 (detecta BOM / bytes nulos)
+- IMPORTANTE: convierte datetime CDMX a tz-naive desde el loader -> NO vuelve a tronar por tz mismatch
+
+Incluye:
+- Métricas por activo (CAGR, vol, sharpe, maxDD, ATR%, ADX, R2, rango, volumen tick)
+- Lateral vs tendencial
+- Top N drawdowns peak->trough
+- Qué pasó esta semana
+- Correlación + rolling corr + clustering (orden por linkage)
+- Regímenes Calm/Mid/Stress + Stress–Calm
+- Picos de volatilidad por activo
+- Comparador 2 activos (normalizado + ratio + volumen MA)
+"""
 
 from __future__ import annotations
 
@@ -25,12 +43,12 @@ except Exception:
 # ---------------- UI ----------------
 st.set_page_config(page_title="MT5 Portfolio Lab", page_icon="📈", layout="wide")
 st.title("📈 MT5 Portfolio Lab (MT5 CSV only)")
-st.caption("Loader calcado del analyzer que sí te parsea. Sin Yahoo. Multi-símbolo.")
+st.caption("Sin Yahoo. Loader tipo analyzer. Ya no truena por timezones.")
 
 TZ_CDMX = pytz.timezone("America/Mexico_City")
 
 # ============================================================
-# 1) Loader MT5 (igual al analyzer: detecta <DATE>, usecols, rename, dt_utc)
+# Loader MT5 (igual al analyzer)
 # ============================================================
 USECOLS = ["<DATE>", "<TIME>", "<OPEN>", "<HIGH>", "<LOW>", "<CLOSE>", "<TICKVOL>"]
 RENAME = {
@@ -44,12 +62,10 @@ RENAME = {
 }
 
 def detect_encoding(b: bytes) -> str:
-    # BOM
     if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
         return "utf-16"
     if b.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
-    # heurística: bytes nulos -> utf-16
     if b"\x00" in b[:2000]:
         return "utf-16"
     return "utf-8-sig"
@@ -65,7 +81,6 @@ def first_line_text(b: bytes, enc: str) -> str:
 def infer_symbol_from_filename(name: str) -> str:
     base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     base = base.rsplit(".", 1)[0].strip()
-    # XAUUSD_M1_2024 -> XAUUSD
     sym = base.split("_")[0].upper()
     sym = re.split(r"[,\s;()\-]+", sym)[0]
     return sym.upper()
@@ -73,9 +88,9 @@ def infer_symbol_from_filename(name: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
     """
-    Devuelve df:
-    datetime_utc (UTC tz-aware), datetime_cdmx (CDMX tz-aware),
-    Open/High/Low/Close/Volume/range_pts
+    Devuelve df con columnas:
+      datetime_cdmx (tz-naive pero en hora CDMX),
+      Open, High, Low, Close, Volume, range_pts
     """
     enc = detect_encoding(file_bytes)
     head = first_line_text(file_bytes, enc)
@@ -87,7 +102,7 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
 
     if is_csv:
         df = None
-        # intento 1: tab (igual que tu analyzer)
+        # intento 1: TAB (igual que tu analyzer)
         try:
             bio.seek(0)
             df = pd.read_csv(bio, sep="\t", usecols=USECOLS, encoding=enc).rename(columns=RENAME)
@@ -101,7 +116,6 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
             df = pd.read_csv(bio, sep=r"\s+", engine="python", usecols=USECOLS, encoding=enc).rename(columns=RENAME)
             info["sep"] = "\\s+"
 
-        # datetime (igual que tu analyzer)
         dt_utc = pd.to_datetime(
             df["Date"].astype(str) + " " + df["Time"].astype(str),
             format="%Y.%m.%d %H:%M:%S",
@@ -111,7 +125,7 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
         df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
 
     else:
-        # fallback alterno
+        # formato alterno (por compatibilidad)
         cols = ["Symbol", "Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         bio.seek(0)
         df = pd.read_csv(bio, names=cols, header=None, delim_whitespace=True, encoding=enc)
@@ -123,23 +137,22 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
         )
         df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
 
-    # a CDMX (como tu analyzer)
-    dt_cdmx = df["datetime_utc"].dt.tz_convert(TZ_CDMX)
-    df = df.assign(datetime_cdmx=dt_cdmx)
-
     # numéricos
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
 
-    df = df.sort_values("datetime_utc")
+    # ✅ key fix: convertir a CDMX y volverlo tz-naive (manteniendo hora local)
+    dt_cdmx_naive = df["datetime_utc"].dt.tz_convert(TZ_CDMX).dt.tz_localize(None)
+
+    df = df.assign(datetime_cdmx=dt_cdmx_naive).sort_values("datetime_cdmx")
     df["range_pts"] = df["High"] - df["Low"]
 
-    return df[["datetime_utc", "datetime_cdmx", "Open", "High", "Low", "Close", "Volume", "range_pts"]], info
+    return df[["datetime_cdmx", "Open", "High", "Low", "Close", "Volume", "range_pts"]], info
 
 
 # ============================================================
-# 2) Resample OHLCV (y FIX del bug: hacer index tz-naive)
+# Resample
 # ============================================================
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
@@ -152,24 +165,19 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
         "Close": x["Close"].resample(rule).last(),
         "Volume":x["Volume"].resample(rule).sum(min_count=1),
     }).dropna(subset=["Close"])
-
-    # ✅ FIX: Streamlit date_input da fechas tz-naive; evitamos comparar aware vs naive
-    if getattr(out.index, "tz", None) is not None:
-        out.index = out.index.tz_localize(None)
-
-    out.index.name = "datetime_cdmx"
+    out.index.name = "datetime"
     return out
 
 
 # ============================================================
-# 3) Métricas / indicadores
+# Metrics / indicators
 # ============================================================
 def ann_factor(rule: str) -> int:
     if rule == "1D": return 252
-    if rule == "1H": return 252 * 24
-    if rule == "15T": return 252 * 96
-    if rule == "5T": return 252 * 288
-    if rule == "1T": return 252 * 1440
+    if rule == "1h": return 252*24
+    if rule == "15min": return 252*96
+    if rule == "5min": return 252*288
+    if rule == "1min": return 252*1440
     return 252
 
 def compute_adx_atr(df: pd.DataFrame, n=14):
@@ -348,13 +356,14 @@ def rolling_vol_peaks(close: pd.Series, win: int, top_n: int, ann: int):
 
 
 # ============================================================
-# Sidebar + Load
+# UI / Load
 # ============================================================
 st.sidebar.header("CSV MT5")
 files = st.sidebar.file_uploader("Sube varios CSV", type=["csv","txt"], accept_multiple_files=True)
 
-freq = st.sidebar.selectbox("Frecuencia (resample)", ["1min","5min","15min","1H","1D"], index=3)
-rule = {"1min":"1T","5min":"5T","15min":"15T","1H":"1H","1D":"1D"}[freq]
+freq_ui = st.sidebar.selectbox("Frecuencia (resample)", ["1min","5min","15min","1H","1D"], index=3)
+rule_map = {"1min":"1min", "5min":"5min", "15min":"15min", "1H":"1h", "1D":"1D"}
+rule = rule_map[freq_ui]
 ann = ann_factor(rule)
 
 roll_vol_days = st.sidebar.slider("Ventana vol rolling (días)", 1, 180, 30)
@@ -362,13 +371,13 @@ roll_corr_days = st.sidebar.slider("Ventana rolling corr (días)", 1, 365, 90)
 top_dd = st.sidebar.selectbox("Top drawdowns", [3,5,10], index=1)
 top_peaks = st.sidebar.selectbox("Top picos vol", [5,10,20,30], index=1)
 
-bars_per_day = {"1T":1440,"5T":288,"15T":96,"1H":24,"1D":1}[rule]
+bars_per_day = {"1min":1440, "5min":288, "15min":96, "1h":24, "1D":1}[rule]
 roll_vol_win = max(10, int(roll_vol_days * bars_per_day))
 roll_corr_win = max(10, int(roll_corr_days * bars_per_day))
 st.sidebar.caption(f"Equivalencia: vol={roll_vol_win} barras, corr={roll_corr_win} barras")
 
 if not files:
-    st.info("Sube tus CSV(s). Ya no debe existir Barras=0.")
+    st.info("Sube tus CSV(s).")
     st.stop()
 
 with st.sidebar.expander("Símbolo por archivo (opcional)", expanded=False):
@@ -379,7 +388,7 @@ with st.sidebar.expander("Símbolo por archivo (opcional)", expanded=False):
         overrides[f.name] = sym.strip().upper()
 
 series: Dict[str, pd.DataFrame] = {}
-meta = []
+meta_rows = []
 
 for f in files:
     sym = overrides.get(f.name, infer_symbol_from_filename(f.name))
@@ -394,7 +403,7 @@ for f in files:
         else:
             series[sym] = rs
 
-    meta.append({
+    meta_rows.append({
         "Archivo": f.name,
         "Símbolo": sym,
         "Barras": int(len(rs)),
@@ -405,8 +414,8 @@ for f in files:
         "Sep": info["sep"],
     })
 
-st.subheader(f"Estado de carga (resample a {freq})")
-st.dataframe(pd.DataFrame(meta), use_container_width=True)
+st.subheader(f"Estado de carga (resample a {freq_ui})")
+st.dataframe(pd.DataFrame(meta_rows), width="stretch")
 
 if not series:
     st.error("No se pudo cargar ningún símbolo.")
@@ -420,19 +429,18 @@ st.sidebar.markdown("---")
 start = st.sidebar.date_input("Inicio", value=gmin)
 end   = st.sidebar.date_input("Fin", value=gmax)
 
-# slicing ya funciona porque index es tz-naive
 data = {}
+start_ts = pd.Timestamp(start)
+end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
 for s in symbols:
     df = series[s]
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
     m = (df.index >= start_ts) & (df.index <= end_ts)
     data[s] = df.loc[m].copy()
 
 symbols = [s for s in symbols if not data[s].empty]
 benchmark = st.sidebar.selectbox("Benchmark (estrés)", options=symbols, index=0)
 
-# métricas + returns
 metrics_rows = []
 rets = {}
 week_rows = []
@@ -456,24 +464,20 @@ summary = pd.DataFrame(metrics_rows).set_index("Símbolo") if metrics_rows else 
 weekdf  = pd.DataFrame(week_rows).set_index("Símbolo") if week_rows else pd.DataFrame()
 rets_df = pd.DataFrame(rets).dropna(how="any") if rets else pd.DataFrame()
 
-
-# ============================================================
-# Tabs
-# ============================================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["✅ Resumen", "🔍 Detalle + DD", "🔗 Correlaciones", "🌡 Estrés vs Calma", "🧨 Eventos + Comparador"])
 
 with tab1:
     st.subheader("Resumen por activo")
     if summary.empty:
-        st.warning("Cargó bien, pero faltan barras para métricas (~200). Usa 1min/5min/15min o amplía rango.")
+        st.warning("Cargó bien, pero faltan barras para métricas (~200). Usa frecuencia más fina o amplía rango.")
     else:
-        st.dataframe(summary.sort_values("Vol anual", ascending=False), use_container_width=True)
+        st.dataframe(summary.sort_values("Vol anual", ascending=False), width="stretch")
 
     st.subheader("Qué pasó esta semana")
     if weekdf.empty:
         st.info("No hay suficiente data para semana en el rango actual.")
     else:
-        st.dataframe(weekdf, use_container_width=True)
+        st.dataframe(weekdf, width="stretch")
 
 with tab2:
     sym = st.selectbox("Símbolo", options=symbols, index=0)
@@ -493,11 +497,11 @@ with tab2:
 
     ev = drawdown_events(close)
     st.markdown(f"### Top {top_dd} drawdowns (peak→trough)")
-    st.dataframe(ev.head(top_dd), use_container_width=True)
+    st.dataframe(ev.head(top_dd), width="stretch")
 
 with tab3:
     if rets_df.empty or rets_df.shape[1] < 2:
-        st.info("Para correlación necesitas 2+ símbolos con retornos suficientes (>=200 barras).")
+        st.info("Para correlación necesitas 2+ símbolos con retornos suficientes.")
     else:
         corr = rets_df.corr()
         st.plotly_chart(px.imshow(corr, text_auto=".2f", aspect="auto", title="Matriz de correlación"), use_container_width=True)
@@ -524,7 +528,7 @@ with tab3:
             Z = linkage(dist_cond, method="average")
             order = leaves_list(Z)
             ordered = corr.iloc[order, order]
-            st.plotly_chart(px.imshow(ordered, text_auto=".2f", aspect="auto", title="Correlación ordenada por clusters"), use_container_width=True)
+            st.plotly_chart(px.imshow(ordered, text_auto=".2f", aspect="auto", title="Correlación ordenada (clusters)"), use_container_width=True)
         else:
             st.info("Clustering requiere SciPy y 3+ activos.")
 
@@ -543,10 +547,11 @@ with tab4:
             reg[(vol >= q_low) & (vol < q_high)] = "Mid"
             reg[vol >= q_high] = "Stress"
 
-            st.dataframe(reg.value_counts().to_frame("barras"), use_container_width=True)
+            st.dataframe(reg.value_counts().to_frame("barras"), width="stretch")
 
             calm_idx = reg[reg=="Calm"].index
             stress_idx = reg[reg=="Stress"].index
+
             r_calm = rets_df.loc[rets_df.index.intersection(calm_idx)]
             r_stress = rets_df.loc[rets_df.index.intersection(stress_idx)]
 
@@ -555,7 +560,6 @@ with tab4:
             else:
                 diff = (r_stress.corr() - r_calm.corr()).fillna(0)
                 st.plotly_chart(px.imshow(diff, text_auto=".2f", aspect="auto", title="Stress - Calm"), use_container_width=True)
-                st.caption("Rojo = en estrés se alinean más. Azul = en estrés se desacoplan.")
 
 with tab5:
     st.subheader("Picos de volatilidad")
@@ -572,7 +576,7 @@ with tab5:
             fig.add_vline(x=d, line_dash="dash", opacity=0.35)
         fig.update_layout(title=f"{sym} – Vol rolling ({roll_vol_win} barras)", height=280, margin=dict(l=20,r=20,t=50,b=20))
         st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(table, use_container_width=True)
+        st.dataframe(table, width="stretch")
 
     st.markdown("---")
     st.subheader("Comparador 2 activos")
