@@ -1378,7 +1378,7 @@ else:
     )
 
 with tab_exec:
-    st.subheader("📌 Resumen Ejecutivo (para tu patrón)")
+    st.subheader("📌 Resumen Ejecutivo")
     st.caption("Aquí está todo lo importante: semáforo, ranking, semana y portafolio sugerido.")
 
     c1, c2, c3, c4 = st.columns(4)
