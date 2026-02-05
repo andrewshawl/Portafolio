@@ -54,7 +54,7 @@ except Exception:
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="MT5 Portfolio Lab", page_icon="📈", layout="wide")
-st.title("📈 MT5 Portfolio Lab — modo patròn (CSV MT5)")
+st.title("📈 MT5 Portfolio Lab — modo facil (CSV MT5)")
 st.caption("Flujo guiado. Sin resampling. El análisis NO corre solo: tú lo disparas con un botón.")
 
 TZ_CDMX = pytz.timezone("America/Mexico_City")
