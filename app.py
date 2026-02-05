@@ -956,7 +956,7 @@ if "ranges" not in st.session_state:
 st.sidebar.header("👔 Modo de uso")
 mode = st.sidebar.radio(
     "¿Para quién es esta vista?",
-    ["👔 Patrón (simple)", "🧠 Analista (detallado)"],
+    ["👔 simple", "🧠 Analista (detallado)"],
     index=0,
 )
 SIMPLE = mode.startswith("👔")
